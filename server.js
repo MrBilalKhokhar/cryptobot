@@ -37,13 +37,30 @@ const MIN_NET = 0.0012;           // minimum 0.12% net profit after fees
 console.log(`\n=== CryptoBot Pro v6 ===`);
 console.log(`Port: ${PORT} | MEXC RT fee: ${(RT_FEE*100).toFixed(2)}%`);
 
+// ── ENV-BASED STORAGE (survives Railway restarts) ─────────────────────────────
+// Railway persists environment variables forever — files get wiped on restart
+// We encode state into env vars via the /saveenv endpoint
+// API keys stored as MEXC_KEY / MEXC_SECRET env vars (set in Railway Variables tab)
+// botOn state stored as BOT_RUNNING env var
+const ENV_KEY    = process.env.MEXC_KEY    || '';
+const ENV_SECRET = process.env.MEXC_SECRET || '';
+const ENV_PAIR   = process.env.BOT_PAIR    || 'BTCUSDT';
+const ENV_MODE   = process.env.BOT_MODE    || 'paper';
+const ENV_STRAT  = process.env.BOT_STRAT   || 'auto';
+const ENV_CAP    = parseFloat(process.env.BOT_CAPITAL || '20');
+const ENV_TP     = parseFloat(process.env.BOT_TP      || '0.35');
+const ENV_SL     = parseFloat(process.env.BOT_SL      || '0.20');
+const ENV_RUNNING= process.env.BOT_RUNNING === 'true';
+
+console.log(`ENV keys loaded: key=${ENV_KEY?'YES':'NO'} secret=${ENV_SECRET?'YES':'NO'} running=${ENV_RUNNING}`);
+
 // ── STATE ─────────────────────────────────────────────────────────────────────
 let S = {
-  botOn:    false,
-  mode:     'paper',     // 'paper' | 'live'
-  strategy: 'auto',      // auto | dip | rsi | bb | ema
-  pair:     'BTCUSDT',
-  capital:  20,
+  botOn:    ENV_RUNNING,           // auto-resume from env
+  mode:     ENV_MODE,
+  strategy: ENV_STRAT,
+  pair:     ENV_PAIR,
+  capital:  ENV_CAP,
   maxPos:   3,
   tpPct:    0.35,        // take profit %
   slPct:    0.20,        // stop loss % (tight)
@@ -61,6 +78,11 @@ let S = {
   log:[], prices:{},
   lastPx:0, startedAt:null, savedAt:null, lastEntry:0
 };
+
+// Seed API keys from environment (Railway persistent vars)
+if (ENV_KEY)    S.apiKey    = ENV_KEY;
+if (ENV_SECRET) S.apiSecret = ENV_SECRET;
+if (S.tpPct < RT_FEE*100+0.12) S.tpPct = RT_FEE*100+0.12;
 
 // ── PRICE BUFFERS ─────────────────────────────────────────────────────────────
 let PX = [];           // timestamped: [{px, ts}]
@@ -642,6 +664,21 @@ const server = http.createServer((req, res) => {
         save(); send(res,200,{ok:true}); return;
       }
 
+      // /savekeys — save API keys as Railway env reminder + in-memory
+      if (url==='/savekeys') {
+        if (d.apiKey && d.apiSecret) {
+          S.apiKey    = d.apiKey;
+          S.apiSecret = d.apiSecret;
+          saveKeys(d.apiKey, d.apiSecret);  // file backup
+          save();
+          log('API keys saved. IMPORTANT: also set MEXC_KEY and MEXC_SECRET in Railway Variables tab to survive restarts.','info');
+          send(res,200,{ok:true, msg:'Keys saved in memory and file. Set MEXC_KEY/MEXC_SECRET in Railway Variables for permanent storage.'});
+        } else {
+          send(res,400,{error:'apiKey and apiSecret required'});
+        }
+        return;
+      }
+
       send(res,404,{error:'Not found'});
     });
     return;
@@ -653,13 +690,26 @@ const server = http.createServer((req, res) => {
 // ── START ─────────────────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server listening on 0.0.0.0:${PORT}`);
+  // Load file-based state (may be empty on Railway — files reset on restart)
   load();
   loadKeys();
+  // Always override with env vars if set (env vars survive restarts)
+  if (ENV_KEY)    { S.apiKey = ENV_KEY;       log('API key loaded from MEXC_KEY env var','info'); }
+  if (ENV_SECRET) { S.apiSecret = ENV_SECRET; log('Secret loaded from MEXC_SECRET env var','info'); }
+  if (ENV_PAIR)   S.pair     = ENV_PAIR;
+  if (ENV_MODE)   S.mode     = ENV_MODE;
+  if (ENV_STRAT)  S.strategy = ENV_STRAT;
   startMulti();
-  if (S.botOn) {
+  // Auto-resume bot if BOT_RUNNING=true env var is set
+  if (S.botOn || ENV_RUNNING) {
+    S.botOn = true;
     S.liveOrders=[]; S.papOrders=[];
-    log('Auto-resuming bot...','info');
+    PX=[]; ticks=0;
+    log('▶ Auto-resuming bot from saved state...','buy');
     startFeed();
+  } else {
+    log('Bot ready. Press Start to begin trading.','info');
+    log('Tip: Set MEXC_KEY + MEXC_SECRET + BOT_RUNNING=true in Railway Variables for auto-start.','info');
   }
 });
 
