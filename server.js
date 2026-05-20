@@ -681,277 +681,294 @@ function send(res, code, data) {
 
 // ── HTTP SERVER ───────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
-  if (req.method==='OPTIONS') { setHeaders(res); res.writeHead(204); res.end(); return; }
+  // Handle CORS preflight first
+  if (req.method === 'OPTIONS') {
+    setHeaders(res);
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   const url = req.url.split('?')[0];
 
-  // ── Public endpoints ────────────────────────────────────────────────────────
-  if (url==='/'||url==='/ping'||url==='/health') {
-    send(res,200,{ok:true,uptime:process.uptime().toFixed(0)+'s',time:new Date().toISOString()});
-    return;
-  }
-  if (url==='/prices') {
-    send(res,200,{prices:S.prices,ticks});
+  // ── PUBLIC endpoints (no PIN required) ──────────────────────────────────────
+  if (url === '/' || url === '/ping' || url === '/health') {
+    send(res, 200, {ok:true, uptime:process.uptime().toFixed(0)+'s', time:new Date().toISOString()});
     return;
   }
 
-  // ── Auth ─────────────────────────────────────────────────────────────────────
+  if (url === '/prices') {
+    send(res, 200, {prices:S.prices, ticks});
+    return;
+  }
+
+  if (url === '/debug') {
+    const keyPreview = S.apiKey ? S.apiKey.substring(0,6)+'••••••'+S.apiKey.slice(-4) : 'NOT SET';
+    const secPreview = S.apiSecret ? S.apiSecret.substring(0,4)+'••••'+S.apiSecret.slice(-4) : 'NOT SET';
+    send(res, 200, {
+      mode:S.mode, botOn:S.botOn, pair:S.pair, strategy:S.strategy,
+      hasApiKey:!!S.apiKey, hasSecret:!!S.apiSecret, keyPreview, secPreview,
+      envKeySet:!!process.env.MEXC_KEY, envSecSet:!!process.env.MEXC_SECRET,
+      envRunning:process.env.BOT_RUNNING, envMode:process.env.BOT_MODE,
+      capital:S.capital, tpPct:S.tpPct, slPct:S.slPct,
+      ticks, warmedUp:ticks>=S.warmup,
+      liveOrders:S.liveOrders.length, papOrders:S.papOrders.length,
+      liveT:S.liveT, papT:S.papT, uptime:process.uptime().toFixed(0)+'s'
+    });
+    return;
+  }
+
+  // ── PIN check — required for all remaining endpoints ────────────────────────
   if (req.headers['x-bot-pin'] !== BOT_PIN) {
-    send(res,401,{error:'Invalid PIN'});
+    send(res, 401, {error:'Invalid PIN'});
     return;
   }
 
   // ── GET /status ──────────────────────────────────────────────────────────────
-  if (req.method==='GET' && url==='/status') {
+  if (req.method === 'GET' && url === '/status') {
     const I = getIndicators();
-    const liveOpen = S.liveOrders.filter(o=>o.status==='open');
-    const papOpen  = S.papOrders.filter(o=>o.status==='open');
-
-    // Add live P&L to open positions
-    const addPnl = o => ({...o, livePnl: feeMath(o.entryPx, S.lastPx, o.amt).net});
-
-    send(res,200,{
-      // Config
+    const addPnl = o => ({...o, livePnl:feeMath(o.entryPx,S.lastPx,o.amt).net});
+    send(res, 200, {
       botOn:S.botOn, mode:S.mode, strategy:S.strategy, pair:S.pair,
       capital:S.capital, maxPos:S.maxPos, tpPct:S.tpPct, slPct:S.slPct,
       trailPct:S.trailPct, maxDaily:S.maxDaily, cooldown:S.cooldown,
-      // Price
       lastPx:S.lastPx, prices:S.prices, ticks, warmup:S.warmup,
-      warmedUp: ticks >= S.warmup,
-      // Live stats
+      warmedUp:ticks>=S.warmup,
       liveProfit:S.liveProfit, todayP:S.todayP, liveT:S.liveT,
       liveW:S.liveW, liveL:S.liveL, bestT:S.bestT, feesT:S.feesT,
-      liveWR: S.liveT>0 ? Math.round(S.liveW/S.liveT*100) : 0,
-      // Paper stats
+      liveWR:S.liveT>0?Math.round(S.liveW/S.liveT*100):0,
       papProfit:S.papProfit, papT:S.papT, papW:S.papW, papL:S.papL,
       papBest:S.papBest, papFees:S.papFees,
-      papWR: S.papT>0 ? Math.round(S.papW/S.papT*100) : 0,
-      // Orders
-      liveOrders: liveOpen.map(addPnl),
-      papOrders:  papOpen.map(addPnl),
-      // History
-      liveTrades: S.liveTrades.slice(0,60),
-      papTrades:  S.papTrades.slice(0,60),
-      // Log
-      log: S.log.slice(0,150),
-      // Meta
-      hasApiKeys:!!(S.apiKey&&S.apiSecret),
-      mexcBalance: S.mexcBalance||null,
+      papWR:S.papT>0?Math.round(S.papW/S.papT*100):0,
+      liveOrders:S.liveOrders.filter(o=>o.status==='open').map(addPnl),
+      papOrders:S.papOrders.filter(o=>o.status==='open').map(addPnl),
+      liveTrades:S.liveTrades.slice(0,60), papTrades:S.papTrades.slice(0,60),
+      log:S.log.slice(0,150),
+      hasApiKeys:!!(S.apiKey&&S.apiSecret), mexcBalance:S.mexcBalance||null,
       startedAt:S.startedAt, savedAt:S.savedAt, feeRt:RT_FEE*100,
-      // Indicators
-      indicators: I ? {
-        rsi14: I.rsi14.toFixed(1), rsi9: I.rsi9.toFixed(1),
-        e9: I.e9.toFixed(4), e21: I.e21.toFixed(4),
-        bbLow:  I.bb?.lower.toFixed(4)||null,
-        bbMid:  I.bb?.middle.toFixed(4)||null,
-        dipFromHi: I.dipFromHi.toFixed(4),
-        ch1: I.ch1.toFixed(4), ch5: I.ch5.toFixed(4),
-        trend: I.trend,
-        lastSig: getSignal(S.lastPx)
-      } : null
+      indicators:I?{
+        rsi14:I.rsi14.toFixed(1), rsi9:I.rsi9.toFixed(1),
+        e9:I.e9.toFixed(4), e21:I.e21.toFixed(4),
+        bbLow:I.bb?.lower.toFixed(4)||null, bbMid:I.bb?.middle.toFixed(4)||null,
+        dipFromHi:I.dipFromHi.toFixed(4), ch1:I.ch1.toFixed(4), ch5:I.ch5.toFixed(4),
+        trend:I.trend, lastSig:getSignal(S.lastPx)
+      }:null
     });
     return;
   }
 
-  // ── POST endpoints ────────────────────────────────────────────────────────────
-  if (req.method==='POST') {
-    let body='';
-    req.on('data',c=>body+=c);
-    req.on('end',()=>{
-      let d={};
-      try{d=JSON.parse(body);}catch(e){}
-
-      // /config
-      if (url==='/config') {
-        if(d.pair)      S.pair      = d.pair.replace('/','');
-        if(d.strategy)  S.strategy  = d.strategy;
-        if(d.mode)      S.mode      = d.mode;
-        if(d.capital)   S.capital   = parseFloat(d.capital)||20;
-        if(d.maxPos)    S.maxPos    = parseInt(d.maxPos)||3;
-        if(d.tpPct)     S.tpPct     = Math.max(parseFloat(d.tpPct), RT_FEE*100+0.12);
-        if(d.slPct)     S.slPct     = Math.max(parseFloat(d.slPct), 0.10);
-        if(d.trailPct)  S.trailPct  = parseFloat(d.trailPct)||0.10;
-        if(d.maxDaily)  S.maxDaily  = parseInt(d.maxDaily)||200;
-        if(d.cooldown)  S.cooldown  = parseInt(d.cooldown)*1000||8000;
-        // Save API keys encrypted if provided
-        if (d.apiKey && d.apiSecret && d.apiKey!=='[saved]') {
-          S.apiKey    = d.apiKey;
-          S.apiSecret = d.apiSecret;
-          saveKeys(d.apiKey, d.apiSecret);
-        }
-        // If mode changed to live, restart feed so it picks up mode immediately
-        const modeChanged = d.mode && d.mode !== (S.mode === d.mode ? d.mode : '');
-        save();
-        log(`Config: ${S.pair} MODE=${S.mode} tp=${S.tpPct}% sl=${S.slPct}% keys=${!!(S.apiKey&&S.apiSecret)}`,'info');
-        if (S.mode==='live' && !(S.apiKey && S.apiSecret)) {
-          log(`⚠ MODE=live but NO API KEYS found. Set MEXC_KEY+MEXC_SECRET in Railway Variables or use Save Keys button.`,'err');
-        }
-        if (S.mode==='live' && S.apiKey && S.apiSecret) {
-          log(`✅ Live mode active. API keys present. Bot will place real orders.`,'buy');
-          S.lastLiveEntry = 0; // reset cooldown so live can enter immediately
-        }
-        send(res,200,{ok:true, tpPct:S.tpPct, slPct:S.slPct, mode:S.mode, hasKeys:!!(S.apiKey&&S.apiSecret)});
-        return;
-      }
-
-      // /start
-      if (url==='/start') {
-        if (S.botOn) { send(res,200,{ok:true,msg:'Already running'}); return; }
-        S.botOn=true; S.liveOrders=[]; S.papOrders=[];
-        S.lastEntry=0; S.startedAt=new Date().toISOString();
-        PX=[]; ticks=0;
-        startFeed();
-        log(`▶ STARTED ${S.pair} [${S.strategy}] mode=${S.mode} $${S.capital} TP=${S.tpPct}% SL=${S.slPct}% cool=${S.cooldown/1000}s warmup=${S.warmup}ticks`,'buy');
-        log(`Paper trades will start ~${Math.ceil(S.warmup*1.5)}s after start`,'info');
-        save();
-        send(res,200,{ok:true});
-        return;
-      }
-
-      // /stop
-      if (url==='/stop') {
-        S.botOn=false; S.liveOrders=[]; S.papOrders=[];
-        stopFeed();
-        log('■ Bot stopped.','info');
-        save();
-        send(res,200,{ok:true});
-        return;
-      }
-
-      // /reset — reset stats only
-      if (url==='/reset') {
-        const ak=S.apiKey, as=S.apiSecret;
-        S.liveProfit=0;S.todayP=0;S.liveT=0;S.liveW=0;S.liveL=0;S.bestT=0;S.feesT=0;
-        S.papProfit=0;S.papT=0;S.papW=0;S.papL=0;S.papBest=0;S.papFees=0;
-        S.liveTrades=[];S.papTrades=[];S.liveOrders=[];S.papOrders=[];S.log=[];
-        S.apiKey=ak;S.apiSecret=as;
-        save(); send(res,200,{ok:true}); return;
-      }
-
-      // /resetpaper
-      if (url==='/resetpaper') {
-        S.papProfit=0;S.papT=0;S.papW=0;S.papL=0;S.papBest=0;S.papFees=0;
-        S.papTrades=[];S.papOrders=[];
-        save(); send(res,200,{ok:true}); return;
-      }
-
-      // /savekeys — save API keys as Railway env reminder + in-memory
-      if (url==='/savekeys') {
-        if (d.apiKey && d.apiSecret) {
-          S.apiKey    = d.apiKey;
-          S.apiSecret = d.apiSecret;
-          saveKeys(d.apiKey, d.apiSecret);  // file backup
-          save();
-          log('API keys saved. IMPORTANT: also set MEXC_KEY and MEXC_SECRET in Railway Variables tab to survive restarts.','info');
-          send(res,200,{ok:true, msg:'Keys saved in memory and file. Set MEXC_KEY/MEXC_SECRET in Railway Variables for permanent storage.'});
-        } else {
-          send(res,400,{error:'apiKey and apiSecret required'});
-        }
-        return;
-      }
-
-      // /setlive — switch to live mode + verify keys in one call
-      if (url==='/setlive') {
-        if (!S.apiKey || !S.apiSecret) {
-          send(res,400,{error:'No API keys saved. Save keys first using Save Keys button.', hasKeys:false});
-          return;
-        }
-        S.mode = 'live';
-        S.lastLiveEntry = 0;  // allow immediate live entry
-        save();
-        log(`🚀 SWITCHED TO LIVE MODE. Pair=${S.pair} Capital=$${S.capital} TP=${S.tpPct}% SL=${S.slPct}%`,'buy');
-        log(`API keys verified in memory. Next signal will place REAL order on MEXC.`,'buy');
-        send(res,200,{ok:true, mode:'live', pair:S.pair, capital:S.capital, hasKeys:true});
-        return;
-      }
-
-      // /setpaper — switch to paper mode safely
-      if (url==='/setpaper') {
-        S.mode = 'paper';
-        save();
-        log(`📝 Switched to PAPER mode.`,'info');
-        send(res,200,{ok:true, mode:'paper'});
-        return;
-      }
-
-      send(res,404,{error:'Not found'});
-    });
-    return;
-  }
-
-  // ── /testconnection — works as GET or POST ──────────────────────────────────
-  if (url==='/testconnection') {
+  // ── GET /balance ─────────────────────────────────────────────────────────────
+  if (url === '/balance') {
     if (!S.apiKey || !S.apiSecret) {
-      send(res,400,{error:'No API keys saved. Go to Config tab → enter MEXC API Key & Secret → click Save API Keys Permanently', hasKeys:false});
-      return;
-    }
-    testMexcConnection();
-    send(res,200,{ok:true, msg:'Testing MEXC connection — check Server Log in 5 seconds for result'});
-    return;
-  }
-
-  // ── /balance — works as GET or POST ─────────────────────────────────────────
-  if (url==='/balance') {
-    if (!S.apiKey || !S.apiSecret) {
-      send(res,400,{error:'No API keys saved. Go to Config tab → Save API Keys first.', hasKeys:false});
+      send(res, 400, {error:'No API keys in server memory. Go to Config → enter keys → Save API Keys Permanently', hasKeys:false});
       return;
     }
     const ts   = Date.now().toString();
     const rawQ = `timestamp=${ts}&recvWindow=5000`;
     const sig  = crypto.createHmac('sha256', S.apiSecret).update(rawQ).digest('hex');
-    const balReq = https.request({
+    const bReq = https.request({
       hostname:'api.mexc.com',
       path:`/api/v3/account?timestamp=${ts}&recvWindow=5000&signature=${sig}`,
       method:'GET',
-      headers:{'X-MEXC-APIKEY':S.apiKey, 'Accept':'application/json', 'User-Agent':'CryptoBotPro/1.0'},
+      headers:{'X-MEXC-APIKEY':S.apiKey,'Accept':'application/json','User-Agent':'CryptoBotPro/1.0'},
       timeout:8000
     }, r => {
       let d='';
-      r.on('data', c => d += c);
+      r.on('data', c => d+=c);
       r.on('end', () => {
         try {
           const acc = JSON.parse(d);
           if (acc.balances) {
-            const usdt = acc.balances.find(b => b.asset === 'USDT');
+            const usdt = acc.balances.find(b=>b.asset==='USDT');
             const coinName = S.pair.replace('USDT','');
-            const coin = acc.balances.find(b => b.asset === coinName);
-            const usdtFree = parseFloat(usdt?.free||0).toFixed(4);
-            log(`💳 MEXC Wallet — USDT: $${usdtFree} free | ${coinName}: ${coin?.free||'0'} free`, 'profit');
+            const coin = acc.balances.find(b=>b.asset===coinName);
+            const free = parseFloat(usdt?.free||0).toFixed(4);
+            S.mexcBalance = free;
+            log(`💳 Wallet — USDT: $${free} free | ${coinName}: ${coin?.free||'0'}`, 'profit');
             send(res, 200, {
               ok:true,
               usdt:{free:usdt?.free||'0', locked:usdt?.locked||'0'},
               coin:{asset:coinName, free:coin?.free||'0', locked:coin?.locked||'0'}
             });
           } else {
-            const errMsg = acc.msg || 'Unknown error';
-            const errCode = acc.code || 0;
-            log(`❌ Balance check failed: code=${errCode} msg=${errMsg}`, 'err');
-            if (errCode===700003) log('❌ Invalid API key — re-check MEXC_KEY in Railway Variables', 'err');
-            if (errCode===700006) log('❌ IP restricted — remove IP whitelist from MEXC API key settings', 'err');
-            send(res, 200, {ok:false, error:errMsg, code:errCode});
+            const code = acc.code||0, msg = acc.msg||'Unknown';
+            log(`❌ Balance failed: code=${code} ${msg}`, 'err');
+            if (code===700003||code==='700003') log('❌ FIX: Invalid API key — re-copy MEXC_KEY from MEXC API Management','err');
+            if (code===700006||code==='700006') log('❌ FIX: IP whitelist blocking — remove IP restriction from MEXC API key','err');
+            send(res, 200, {ok:false, error:msg, code});
           }
-        } catch(e) {
-          log(`Balance parse error: ${e.message}`, 'err');
-          send(res, 500, {error:e.message});
-        }
+        } catch(e) { send(res, 500, {error:e.message}); }
       });
     });
-    balReq.on('error', e => {
-      log(`Balance request error: ${e.message}`, 'err');
-      send(res, 500, {error:e.message});
-    });
-    balReq.on('timeout', () => {
-      balReq.destroy();
-      log('Balance request timeout', 'err');
-      send(res, 500, {error:'MEXC API timeout'});
-    });
-    balReq.end();
+    bReq.on('error', e=>{log('Balance err:'+e.message,'err');send(res,500,{error:e.message});});
+    bReq.on('timeout', ()=>{bReq.destroy();send(res,500,{error:'MEXC timeout'});});
+    bReq.end();
     return;
   }
 
-  send(res,404,{error:'Not found'});
+  // ── GET or POST /testconnection ───────────────────────────────────────────────
+  if (url === '/testconnection') {
+    if (!S.apiKey || !S.apiSecret) {
+      send(res, 400, {error:'No API keys in server memory. Go to Config → enter MEXC keys → Save API Keys Permanently', hasKeys:false});
+      return;
+    }
+    testMexcConnection();
+    send(res, 200, {ok:true, msg:'Testing MEXC — check Server Log in 5 seconds'});
+    return;
+  }
+
+  // ── All POST endpoints ────────────────────────────────────────────────────────
+  if (req.method !== 'POST') {
+    send(res, 404, {error:'Not found'});
+    return;
+  }
+
+  let body = '';
+  req.on('data', c => body += c);
+  req.on('end', () => {
+    let d = {};
+    try { d = JSON.parse(body); } catch(e) {}
+
+    // /savekeys
+    if (url === '/savekeys') {
+      if (!d.apiKey || !d.apiSecret) {
+        send(res, 400, {error:'apiKey and apiSecret required'});
+        return;
+      }
+      const rawKey = d.apiKey.trim();
+      const rawSec = d.apiSecret.trim();
+      if (rawKey.length < 10 || rawSec.length < 10) {
+        send(res, 400, {error:'Key looks too short — copy the full key from MEXC'});
+        return;
+      }
+      S.apiKey    = rawKey;
+      S.apiSecret = rawSec;
+      saveKeys(rawKey, rawSec);
+      save();
+      log(`Keys saved: ${rawKey.substring(0,6)}••••${rawKey.slice(-4)} (len=${rawKey.length})`, 'info');
+      // Immediately test keys
+      const ts   = Date.now().toString();
+      const rawQ = `timestamp=${ts}&recvWindow=5000`;
+      const sig  = crypto.createHmac('sha256', rawSec).update(rawQ).digest('hex');
+      https.request({
+        hostname:'api.mexc.com',
+        path:`/api/v3/account?timestamp=${ts}&recvWindow=5000&signature=${sig}`,
+        method:'GET',
+        headers:{'X-MEXC-APIKEY':rawKey,'Accept':'application/json','User-Agent':'CryptoBotPro/1.0'},
+        timeout:8000
+      }, r => {
+        let rd=''; r.on('data',c=>rd+=c);
+        r.on('end',()=>{
+          try {
+            const acc = JSON.parse(rd);
+            if (acc.balances) {
+              const usdt = acc.balances.find(b=>b.asset==='USDT');
+              const bal  = parseFloat(usdt?.free||0).toFixed(4);
+              S.mexcBalance = bal;
+              log(`✅ MEXC KEYS VERIFIED! USDT balance: $${bal} — real orders will work`, 'profit');
+            } else {
+              log(`❌ Key test failed: code=${acc.code} msg=${acc.msg}`, 'err');
+              if (acc.code===700003||acc.code==='700003') log('❌ FIX: Wrong API key — re-copy from MEXC API Management page','err');
+              if (acc.code===700006||acc.code==='700006') log('❌ FIX: IP whitelist on — go to MEXC → API Management → remove IP restriction','err');
+            }
+          } catch(e) { log('Key test err:'+e.message,'err'); }
+        });
+      }).on('error', e=>log('Key test net err:'+e.message,'err')).end();
+
+      send(res, 200, {ok:true, keyLength:rawKey.length, secLength:rawSec.length,
+        msg:'Keys saved. Testing with MEXC — check Server Log in 5 seconds.'});
+      return;
+    }
+
+    // /config
+    if (url === '/config') {
+      if(d.pair)     S.pair     = d.pair.replace('/','');
+      if(d.strategy) S.strategy = d.strategy;
+      if(d.mode)     S.mode     = d.mode;
+      if(d.capital)  S.capital  = parseFloat(d.capital)||20;
+      if(d.maxPos)   S.maxPos   = parseInt(d.maxPos)||3;
+      if(d.tpPct)    S.tpPct    = Math.max(parseFloat(d.tpPct), RT_FEE*100+0.12);
+      if(d.slPct)    S.slPct    = Math.max(parseFloat(d.slPct), 0.10);
+      if(d.trailPct) S.trailPct = parseFloat(d.trailPct)||0.10;
+      if(d.maxDaily) S.maxDaily = parseInt(d.maxDaily)||200;
+      if(d.cooldown) S.cooldown = parseInt(d.cooldown)*1000||8000;
+      if(d.apiKey && d.apiSecret && d.apiKey!=='[saved]') {
+        S.apiKey=d.apiKey.trim(); S.apiSecret=d.apiSecret.trim();
+        saveKeys(S.apiKey, S.apiSecret);
+      }
+      if(S.mode==='live') S.lastLiveEntry=0;
+      save();
+      log(`Config: ${S.pair} MODE=${S.mode} tp=${S.tpPct}% sl=${S.slPct}% keys=${!!(S.apiKey&&S.apiSecret)}`,'info');
+      send(res, 200, {ok:true, tpPct:S.tpPct, slPct:S.slPct, mode:S.mode, hasKeys:!!(S.apiKey&&S.apiSecret)});
+      return;
+    }
+
+    // /start
+    if (url === '/start') {
+      if (S.botOn) { send(res,200,{ok:true,msg:'Already running'}); return; }
+      S.botOn=true; S.liveOrders=[]; S.papOrders=[];
+      S.lastEntry=0; S.startedAt=new Date().toISOString();
+      PX=[]; ticks=0;
+      startFeed();
+      log(`▶ STARTED ${S.pair} [${S.strategy}] mode=${S.mode} $${S.capital} keys=${!!(S.apiKey&&S.apiSecret)}`,'buy');
+      save();
+      send(res, 200, {ok:true});
+      return;
+    }
+
+    // /stop
+    if (url === '/stop') {
+      S.botOn=false; S.liveOrders=[]; S.papOrders=[];
+      stopFeed();
+      log('■ Bot stopped.','info');
+      save();
+      send(res, 200, {ok:true});
+      return;
+    }
+
+    // /setlive
+    if (url === '/setlive') {
+      if (!S.apiKey || !S.apiSecret) {
+        send(res, 400, {error:'No API keys. Save keys first.', hasKeys:false});
+        return;
+      }
+      S.mode='live'; S.lastLiveEntry=0;
+      save();
+      log(`🚀 LIVE MODE ON: ${S.pair} $${S.capital} TP=${S.tpPct}% SL=${S.slPct}%`,'buy');
+      send(res, 200, {ok:true, mode:'live', pair:S.pair, capital:S.capital, hasKeys:true});
+      return;
+    }
+
+    // /setpaper
+    if (url === '/setpaper') {
+      S.mode='paper'; save();
+      log('📝 Paper mode.','info');
+      send(res, 200, {ok:true, mode:'paper'});
+      return;
+    }
+
+    // /reset
+    if (url === '/reset') {
+      const ak=S.apiKey, as=S.apiSecret;
+      S.liveProfit=0;S.todayP=0;S.liveT=0;S.liveW=0;S.liveL=0;S.bestT=0;S.feesT=0;
+      S.papProfit=0;S.papT=0;S.papW=0;S.papL=0;S.papBest=0;S.papFees=0;
+      S.liveTrades=[];S.papTrades=[];S.liveOrders=[];S.papOrders=[];S.log=[];
+      S.apiKey=ak; S.apiSecret=as;
+      save(); send(res, 200, {ok:true}); return;
+    }
+
+    // /resetpaper
+    if (url === '/resetpaper') {
+      S.papProfit=0;S.papT=0;S.papW=0;S.papL=0;S.papBest=0;S.papFees=0;
+      S.papTrades=[];S.papOrders=[];
+      save(); send(res, 200, {ok:true}); return;
+    }
+
+    send(res, 404, {error:'Not found: '+url});
+  });
 });
 
-// ── START ─────────────────────────────────────────────────────────────────────
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server listening on 0.0.0.0:${PORT}`);
   // Load file-based state (may be empty on Railway — files reset on restart)
@@ -964,6 +981,12 @@ server.listen(PORT, '0.0.0.0', () => {
   if (ENV_MODE)   S.mode     = ENV_MODE;
   if (ENV_STRAT)  S.strategy = ENV_STRAT;
   startMulti();
+  // Log key status clearly on startup
+  if (S.apiKey) {
+    log(`Keys in memory: key=${S.apiKey.substring(0,6)}••••${S.apiKey.slice(-4)} (${S.apiKey.length} chars)`, 'info');
+  } else {
+    log('⚠ NO API KEYS in memory. Set MEXC_KEY + MEXC_SECRET in Railway Variables tab, or use Save API Keys button in dashboard.', 'err');
+  }
   // Auto-resume bot if BOT_RUNNING=true env var is set
   if (S.botOn || ENV_RUNNING) {
     S.botOn = true;
