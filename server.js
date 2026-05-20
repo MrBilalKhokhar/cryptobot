@@ -76,7 +76,7 @@ let S = {
   // Orders & history
   liveOrders:[], papOrders:[], liveTrades:[], papTrades:[],
   log:[], prices:{},
-  lastPx:0, startedAt:null, savedAt:null, lastEntry:0
+  lastPx:0, startedAt:null, savedAt:null, lastEntry:0, lastLiveEntry:0
 };
 
 // Seed API keys from environment (Railway persistent vars)
@@ -409,13 +409,19 @@ function onTick(px) {
   }
 
   if (S.mode === 'live' && S.apiKey && S.apiSecret) {
-    const liveOpen = S.liveOrders.filter(o=>o.status==='open').length;
-    if (liveOpen < S.maxPos) {
-      enter(px, sig.reason, false);
+    // Live has its own cooldown so paper entries don't block it
+    const liveCD = (now - (S.lastLiveEntry||0)) >= S.cooldown;
+    if (liveCD) {
+      const liveOpen = S.liveOrders.filter(o=>o.status==='open').length;
+      if (liveOpen < S.maxPos && S.liveT < S.maxDaily) {
+        enter(px, sig.reason, false);
+        S.lastLiveEntry = now;
+      }
     }
   }
 
-  S.lastEntry = now;
+  S.lastEntry     = now;  // shared cooldown (prevents signal spam)
+  S.lastLiveEntry = now;  // separate live cooldown
 }
 
 // ── ENTER TRADE ───────────────────────────────────────────────────────────────
@@ -443,7 +449,8 @@ function enter(px, reason, isPaper) {
     log(`📝 PAPER BUY ${S.strategy} @ $${px.toFixed(4)} TP=$${tp.toFixed(4)} SL=$${sl.toFixed(4)} [${reason}]`,'buy');
   } else {
     S.liveOrders.push(o);
-    log(`💰 LIVE BUY ${S.strategy} @ $${px.toFixed(4)} TP=$${tp.toFixed(4)} SL=$${sl.toFixed(4)} [${reason}]`,'buy');
+    log(`💰 LIVE BUY ${S.strategy} @ $${px.toFixed(4)} | amt=$${amt.toFixed(2)} qty=${o.qty.toFixed(6)} | TP=$${tp.toFixed(4)} SL=$${sl.toFixed(4)} [${reason}]`,'buy');
+    log(`💰 Placing MEXC market order: BUY ${o.qty.toFixed(6)} ${S.pair}`,'buy');
     placeOrder('BUY', o.qty, S.pair);
   }
 }
@@ -668,9 +675,18 @@ const server = http.createServer((req, res) => {
           S.apiSecret = d.apiSecret;
           saveKeys(d.apiKey, d.apiSecret);
         }
+        // If mode changed to live, restart feed so it picks up mode immediately
+        const modeChanged = d.mode && d.mode !== (S.mode === d.mode ? d.mode : '');
         save();
-        log(`Config: ${S.pair} ${S.mode} tp=${S.tpPct}% sl=${S.slPct}% trail=${S.trailPct}% cool=${S.cooldown/1000}s`,'info');
-        send(res,200,{ok:true, tpPct:S.tpPct, slPct:S.slPct});
+        log(`Config: ${S.pair} MODE=${S.mode} tp=${S.tpPct}% sl=${S.slPct}% keys=${!!(S.apiKey&&S.apiSecret)}`,'info');
+        if (S.mode==='live' && !(S.apiKey && S.apiSecret)) {
+          log(`⚠ MODE=live but NO API KEYS found. Set MEXC_KEY+MEXC_SECRET in Railway Variables or use Save Keys button.`,'err');
+        }
+        if (S.mode==='live' && S.apiKey && S.apiSecret) {
+          log(`✅ Live mode active. API keys present. Bot will place real orders.`,'buy');
+          S.lastLiveEntry = 0; // reset cooldown so live can enter immediately
+        }
+        send(res,200,{ok:true, tpPct:S.tpPct, slPct:S.slPct, mode:S.mode, hasKeys:!!(S.apiKey&&S.apiSecret)});
         return;
       }
 
@@ -727,6 +743,30 @@ const server = http.createServer((req, res) => {
         } else {
           send(res,400,{error:'apiKey and apiSecret required'});
         }
+        return;
+      }
+
+      // /setlive — switch to live mode + verify keys in one call
+      if (url==='/setlive') {
+        if (!S.apiKey || !S.apiSecret) {
+          send(res,400,{error:'No API keys saved. Save keys first using Save Keys button.', hasKeys:false});
+          return;
+        }
+        S.mode = 'live';
+        S.lastLiveEntry = 0;  // allow immediate live entry
+        save();
+        log(`🚀 SWITCHED TO LIVE MODE. Pair=${S.pair} Capital=$${S.capital} TP=${S.tpPct}% SL=${S.slPct}%`,'buy');
+        log(`API keys verified in memory. Next signal will place REAL order on MEXC.`,'buy');
+        send(res,200,{ok:true, mode:'live', pair:S.pair, capital:S.capital, hasKeys:true});
+        return;
+      }
+
+      // /setpaper — switch to paper mode safely
+      if (url==='/setpaper') {
+        S.mode = 'paper';
+        save();
+        log(`📝 Switched to PAPER mode.`,'info');
+        send(res,200,{ok:true, mode:'paper'});
         return;
       }
 
