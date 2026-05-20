@@ -873,57 +873,78 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      // /testconnection — test MEXC API keys and get balance
-      if (url==='/testconnection') {
-        if (!S.apiKey || !S.apiSecret) {
-          send(res,400,{error:'No API keys saved. Add keys first.', hasKeys:false});
-          return;
-        }
-        testMexcConnection();
-        send(res,200,{ok:true, msg:'Testing MEXC connection... check server log in 5 seconds'});
-        return;
-      }
-
-      // /balance — get live MEXC USDT balance
-      if (url==='/balance') {
-        if (!S.apiKey || !S.apiSecret) {
-          send(res,400,{error:'No API keys', hasKeys:false});
-          return;
-        }
-        const ts  = Date.now().toString();
-        const rawQ= `timestamp=${ts}&recvWindow=5000`;
-        const sig = crypto.createHmac('sha256',S.apiSecret).update(rawQ).digest('hex');
-        https.request({
-          hostname:'api.mexc.com',
-          path:`/api/v3/account?timestamp=${ts}&recvWindow=5000&signature=${sig}`,
-          method:'GET',
-          headers:{'X-MEXC-APIKEY':S.apiKey,'Accept':'application/json'},
-          timeout:6000
-        }, r => {
-          let d=''; r.on('data',c=>d+=c);
-          r.on('end',()=>{
-            try {
-              const acc=JSON.parse(d);
-              if(acc.balances){
-                const usdt=acc.balances.find(b=>b.asset==='USDT');
-                const pair=S.pair.replace('USDT','');
-                const coin=acc.balances.find(b=>b.asset===pair);
-                send(res,200,{
-                  ok:true,
-                  usdt:{free:usdt?.free||'0', locked:usdt?.locked||'0'},
-                  coin:{asset:pair, free:coin?.free||'0', locked:coin?.locked||'0'}
-                });
-              } else {
-                send(res,200,{ok:false, error:acc.msg||'Unknown', code:acc.code});
-              }
-            } catch(e){send(res,500,{error:e.message});}
-          });
-        }).on('error',e=>send(res,500,{error:e.message})).end();
-        return;
-      }
-
       send(res,404,{error:'Not found'});
     });
+    return;
+  }
+
+  // ── /testconnection — works as GET or POST ──────────────────────────────────
+  if (url==='/testconnection') {
+    if (!S.apiKey || !S.apiSecret) {
+      send(res,400,{error:'No API keys saved. Go to Config tab → enter MEXC API Key & Secret → click Save API Keys Permanently', hasKeys:false});
+      return;
+    }
+    testMexcConnection();
+    send(res,200,{ok:true, msg:'Testing MEXC connection — check Server Log in 5 seconds for result'});
+    return;
+  }
+
+  // ── /balance — works as GET or POST ─────────────────────────────────────────
+  if (url==='/balance') {
+    if (!S.apiKey || !S.apiSecret) {
+      send(res,400,{error:'No API keys saved. Go to Config tab → Save API Keys first.', hasKeys:false});
+      return;
+    }
+    const ts   = Date.now().toString();
+    const rawQ = `timestamp=${ts}&recvWindow=5000`;
+    const sig  = crypto.createHmac('sha256', S.apiSecret).update(rawQ).digest('hex');
+    const balReq = https.request({
+      hostname:'api.mexc.com',
+      path:`/api/v3/account?timestamp=${ts}&recvWindow=5000&signature=${sig}`,
+      method:'GET',
+      headers:{'X-MEXC-APIKEY':S.apiKey, 'Accept':'application/json', 'User-Agent':'CryptoBotPro/1.0'},
+      timeout:8000
+    }, r => {
+      let d='';
+      r.on('data', c => d += c);
+      r.on('end', () => {
+        try {
+          const acc = JSON.parse(d);
+          if (acc.balances) {
+            const usdt = acc.balances.find(b => b.asset === 'USDT');
+            const coinName = S.pair.replace('USDT','');
+            const coin = acc.balances.find(b => b.asset === coinName);
+            const usdtFree = parseFloat(usdt?.free||0).toFixed(4);
+            log(`💳 MEXC Wallet — USDT: $${usdtFree} free | ${coinName}: ${coin?.free||'0'} free`, 'profit');
+            send(res, 200, {
+              ok:true,
+              usdt:{free:usdt?.free||'0', locked:usdt?.locked||'0'},
+              coin:{asset:coinName, free:coin?.free||'0', locked:coin?.locked||'0'}
+            });
+          } else {
+            const errMsg = acc.msg || 'Unknown error';
+            const errCode = acc.code || 0;
+            log(`❌ Balance check failed: code=${errCode} msg=${errMsg}`, 'err');
+            if (errCode===700003) log('❌ Invalid API key — re-check MEXC_KEY in Railway Variables', 'err');
+            if (errCode===700006) log('❌ IP restricted — remove IP whitelist from MEXC API key settings', 'err');
+            send(res, 200, {ok:false, error:errMsg, code:errCode});
+          }
+        } catch(e) {
+          log(`Balance parse error: ${e.message}`, 'err');
+          send(res, 500, {error:e.message});
+        }
+      });
+    });
+    balReq.on('error', e => {
+      log(`Balance request error: ${e.message}`, 'err');
+      send(res, 500, {error:e.message});
+    });
+    balReq.on('timeout', () => {
+      balReq.destroy();
+      log('Balance request timeout', 'err');
+      send(res, 500, {error:'MEXC API timeout'});
+    });
+    balReq.end();
     return;
   }
 
