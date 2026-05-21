@@ -37,6 +37,17 @@ const MIN_NET = 0.0012;           // minimum 0.12% net profit after fees
 console.log(`\n=== CryptoBot Pro v6 ===`);
 console.log(`Port: ${PORT} | MEXC RT fee: ${(RT_FEE*100).toFixed(2)}%`);
 
+// Sanitize API keys — remove ALL whitespace, quotes, newlines, invisible chars
+function sanitizeKey(k) {
+  if (!k) return '';
+  return String(k)
+    .replace(/[\r\n\t]/g, '')   // remove newlines/tabs
+    .replace(/\s+/g, '')          // remove all whitespace
+    .replace(/['"]/g, '')          // remove quotes
+    .replace(/[^\x20-\x7E]/g, '') // remove non-printable chars
+    .trim();
+}
+
 // ── ENV-BASED STORAGE (survives Railway restarts) ─────────────────────────────
 // Railway persists environment variables forever — files get wiped on restart
 // We encode state into env vars via the /saveenv endpoint
@@ -79,9 +90,9 @@ let S = {
   lastPx:0, startedAt:null, savedAt:null, lastEntry:0, lastLiveEntry:0, mexcBalance:null
 };
 
-// Seed API keys from environment (Railway persistent vars)
-if (ENV_KEY)    S.apiKey    = ENV_KEY;
-if (ENV_SECRET) S.apiSecret = ENV_SECRET;
+// Seed API keys from environment — always sanitize to remove invisible chars
+if (ENV_KEY)    S.apiKey    = sanitizeKey(ENV_KEY);
+if (ENV_SECRET) S.apiSecret = sanitizeKey(ENV_SECRET);
 if (S.tpPct < RT_FEE*100+0.12) S.tpPct = RT_FEE*100+0.12;
 
 // ── PRICE BUFFERS ─────────────────────────────────────────────────────────────
@@ -130,8 +141,10 @@ function loadKeys() {
     const d   = crypto.createDecipheriv('aes-256-cbc', key, Buffer.from(f.iv,'hex'));
     const dec = Buffer.concat([d.update(Buffer.from(f.enc,'hex')), d.final()]);
     const {k,s} = JSON.parse(dec.toString('utf8'));
-    S.apiKey = k||''; S.apiSecret = s||'';
-    if (S.apiKey) log('API keys loaded from encrypted storage.','info');
+    // Always sanitize loaded keys
+    S.apiKey    = sanitizeKey(k||'');
+    S.apiSecret = sanitizeKey(s||'');
+    if (S.apiKey) log(`Keys loaded from file: len=${S.apiKey.length}`,'info');
   } catch(e) { log('Key load err:'+e.message,'err'); }
 }
 
@@ -722,10 +735,19 @@ const server = http.createServer((req, res) => {
   if (url === '/debug') {
     const keyPreview = S.apiKey ? S.apiKey.substring(0,6)+'••••••'+S.apiKey.slice(-4) : 'NOT SET';
     const secPreview = S.apiSecret ? S.apiSecret.substring(0,4)+'••••'+S.apiSecret.slice(-4) : 'NOT SET';
+    // Also show raw env var to check for invisible chars
+    const envKeyRaw  = process.env.MEXC_KEY    || '';
+    const envSecRaw  = process.env.MEXC_SECRET || '';
+    const envKeySan  = sanitizeKey(envKeyRaw);
+    const envSecSan  = sanitizeKey(envSecRaw);
     send(res, 200, {
       mode:S.mode, botOn:S.botOn, pair:S.pair, strategy:S.strategy,
       hasApiKey:!!S.apiKey, hasSecret:!!S.apiSecret, keyPreview, secPreview,
+      keyLen: S.apiKey.length, secLen: S.apiSecret.length,
       envKeySet:!!process.env.MEXC_KEY, envSecSet:!!process.env.MEXC_SECRET,
+      envKeyLen: envKeyRaw.length, envKeySanLen: envKeySan.length,
+      envSecLen: envSecRaw.length, envSecSanLen: envSecSan.length,
+      envKeyMatch: envKeyRaw === envKeySan,
       envRunning:process.env.BOT_RUNNING, envMode:process.env.BOT_MODE,
       capital:S.capital, tpPct:S.tpPct, slPct:S.slPct,
       ticks, warmedUp:ticks>=S.warmup,
@@ -834,8 +856,10 @@ const server = http.createServer((req, res) => {
         send(res, 400, {error:'apiKey and apiSecret required'});
         return;
       }
-      const rawKey = d.apiKey.trim();
-      const rawSec = d.apiSecret.trim();
+      const rawKey = sanitizeKey(d.apiKey);
+      const rawSec = sanitizeKey(d.apiSecret);
+      log(`Sanitized key: len=${rawKey.length} first6=${rawKey.substring(0,6)} last4=${rawKey.slice(-4)}`,'info');
+      log(`Sanitized sec: len=${rawSec.length} first4=${rawSec.substring(0,4)} last4=${rawSec.slice(-4)}`,'info');
       if (rawKey.length < 10 || rawSec.length < 10) {
         send(res, 400, {error:'Key looks too short — copy the full key from MEXC'});
         return;
@@ -879,8 +903,9 @@ const server = http.createServer((req, res) => {
       if(d.trailPct) S.trailPct = parseFloat(d.trailPct)||0.10;
       if(d.maxDaily) S.maxDaily = parseInt(d.maxDaily)||200;
       if(d.cooldown) S.cooldown = parseInt(d.cooldown)*1000||8000;
-      if(d.apiKey && d.apiSecret && d.apiKey!=='[saved]') {
-        S.apiKey=d.apiKey.trim(); S.apiSecret=d.apiSecret.trim();
+      if(d.apiKey && d.apiSecret && d.apiKey!=='[saved]' && d.apiKey.length>5) {
+        S.apiKey    = sanitizeKey(d.apiKey);
+        S.apiSecret = sanitizeKey(d.apiSecret);
         saveKeys(S.apiKey, S.apiSecret);
       }
       if(S.mode==='live') S.lastLiveEntry=0;
