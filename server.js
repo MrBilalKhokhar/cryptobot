@@ -541,128 +541,145 @@ function exitCheck(px, isPaper) {
   }
 }
 
-// ── MEXC ORDER (corrected v3 signing) ────────────────────────────────────────
-// MEXC v3 signature: HMAC-SHA256 of the raw query string (no URL encoding of values)
-function placeOrder(side, qty, pair) {
-  if (!S.apiKey || !S.apiSecret) {
-    log(`⚠ placeOrder called but no API keys — skipping`, 'err');
-    return;
-  }
-  const sym = pair.replace('/','');
-  const usdtAmt = (qty * S.lastPx).toFixed(2);
+// ── MEXC API SIGNING (FIXED) ─────────────────────────────────────────────────
+//
+// MEXC v3 correct signing rules:
+// 1. Build query string from ALL params including timestamp & recvWindow
+// 2. Sign that exact raw string with HMAC-SHA256
+// 3. For GET: append ?querystring&signature=SIG to URL
+// 4. For POST: send querystring&signature=SIG in the BODY as form-urlencoded
+//    Content-Type: application/x-www-form-urlencoded
+//
+// CRITICAL: The signed string must match EXACTLY what is sent.
+// Do NOT url-encode values when building the signature string.
+// Do NOT add any extra params after signing.
 
-  // Build params object — MEXC market orders:
-  // BUY  → use quoteOrderQty (spend X USDT)
-  // SELL → use quantity (sell X coins)
-  const params = {
-    symbol:    sym,
-    side:      side.toUpperCase(),
-    type:      'MARKET',
-    timestamp: Date.now().toString(),
-    recvWindow:'5000'
+function mexcRequest(method, urlPath, params, apiKey, apiSecret, callback) {
+  // Step 1: add timestamp and recvWindow
+  const allParams = {
+    ...params,
+    timestamp:  Date.now().toString(),
+    recvWindow: '5000'
   };
-  if (side.toUpperCase() === 'BUY') {
-    params.quoteOrderQty = usdtAmt;
-    log(`💰 Sending MEXC BUY: $${usdtAmt} USDT of ${sym}`, 'buy');
+
+  // Step 2: build raw query string (no url-encoding) for signature
+  const rawQS = Object.keys(allParams)
+    .map(k => `${k}=${allParams[k]}`)
+    .join('&');
+
+  // Step 3: sign
+  const signature = crypto
+    .createHmac('sha256', apiSecret)
+    .update(rawQS)
+    .digest('hex');
+
+  // Step 4: build final query string WITH signature
+  const finalQS = rawQS + '&signature=' + signature;
+
+  // Step 5: set up request
+  let reqPath, reqBody, headers;
+
+  if (method === 'GET') {
+    reqPath  = `${urlPath}?${finalQS}`;
+    reqBody  = '';
+    headers  = {
+      'X-MEXC-APIKEY': apiKey,
+      'Accept':        'application/json',
+      'User-Agent':    'CryptoBotPro/1.0'
+    };
   } else {
-    // Round qty to 2 decimal places for most MEXC pairs
-    params.quantity = parseFloat(qty).toFixed(2);
-    log(`💰 Sending MEXC SELL: ${params.quantity} ${sym}`, 'sell');
+    // POST: params go in body, NOT in URL
+    reqPath  = urlPath;
+    reqBody  = finalQS;
+    headers  = {
+      'X-MEXC-APIKEY':  apiKey,
+      'Content-Type':   'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(reqBody).toString(),
+      'Accept':         'application/json',
+      'User-Agent':     'CryptoBotPro/1.0'
+    };
   }
 
-  // MEXC v3: sign the raw query string (values NOT URL-encoded in signature input)
-  const rawQS = Object.entries(params).map(([k,v])=>`${k}=${v}`).join('&');
-  const sig   = crypto.createHmac('sha256', S.apiSecret).update(rawQS).digest('hex');
-
-  // Path uses URL-encoded query string + signature
-  const urlQS = Object.entries(params).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join('&');
-  const fullPath = `/api/v3/order?${urlQS}&signature=${sig}`;
-
-  log(`💰 MEXC API call: POST ${fullPath.substring(0,80)}...`, 'info');
-
-  const req = https.request({
+  const opts = {
     hostname: 'api.mexc.com',
-    path:     fullPath,
-    method:   'POST',
-    headers: {
-      'X-MEXC-APIKEY': S.apiKey,
-      'Content-Type':  'application/json',
-      'Accept':        'application/json'
-    },
+    path:     reqPath,
+    method,
+    headers,
     timeout: 8000
-  }, res => {
+  };
+
+  const req = https.request(opts, res => {
     let d = '';
     res.on('data', c => d += c);
     res.on('end', () => {
-      try {
-        const r = JSON.parse(d);
-        if (r.orderId) {
-          log(`✅ MEXC ${side} ORDER FILLED! orderId=${r.orderId} symbol=${r.symbol} qty=${r.executedQty} price=${r.price}`, 'profit');
-          log(`✅ Your MEXC wallet balance has changed — check Spot wallet`, 'profit');
-        } else if (r.code) {
-          // MEXC error codes
-          log(`❌ MEXC ORDER FAILED code=${r.code} msg=${r.msg}`, 'err');
-          if (r.code === -1100) log(`❌ Bad parameter — check pair name (use BTCUSDT not BTC/USDT)`, 'err');
-          if (r.code === -1111) log(`❌ Quantity precision error — amount too small or wrong decimal`, 'err');
-          if (r.code === -2010) log(`❌ Insufficient balance in MEXC Spot wallet`, 'err');
-          if (r.code === -1021) log(`❌ Timestamp error — server clock out of sync`, 'err');
-          if (r.code === 700003) log(`❌ API key invalid or Spot Trade permission not enabled on MEXC`, 'err');
-          if (r.code === 700006) log(`❌ IP not whitelisted — remove IP restriction from MEXC API key settings`, 'err');
-          if (r.code === 30004) log(`❌ Insufficient USDT balance — add funds to MEXC Spot wallet`, 'err');
-        } else {
-          log(`MEXC ${side} response: ${JSON.stringify(r)}`, 'info');
-        }
-      } catch(e) {
-        log(`MEXC parse error: ${e.message} raw=${d.substring(0,200)}`, 'err');
-      }
+      try { callback(null, JSON.parse(d)); }
+      catch(e) { callback(new Error('JSON parse: ' + d.substring(0,100))); }
     });
   });
-  req.on('error',   e => log(`MEXC network error: ${e.message}`, 'err'));
-  req.on('timeout', () => { req.destroy(); log(`MEXC request timeout`, 'err'); });
+  req.on('error',   e => callback(e));
+  req.on('timeout', () => { req.destroy(); callback(new Error('timeout')); });
+  if (reqBody) req.write(reqBody);
   req.end();
 }
 
-// ── TEST ORDER ENDPOINT (dry run — checks connection without real order) ────────
-function testMexcConnection() {
+// ─── PLACE ORDER ─────────────────────────────────────────────────────────────
+function placeOrder(side, qty, pair) {
   if (!S.apiKey || !S.apiSecret) {
-    log('testMexcConnection: no API keys', 'err');
+    log('⚠ No API keys — order skipped', 'err');
     return;
   }
-  // Use /api/v3/account to check balance — confirms keys work
-  const ts = Date.now().toString();
-  const rawQS = `timestamp=${ts}&recvWindow=5000`;
-  const sig   = crypto.createHmac('sha256', S.apiSecret).update(rawQS).digest('hex');
+  const sym = pair.replace('/','');
+  const params = { symbol:sym, side:side.toUpperCase(), type:'MARKET' };
 
-  const req = https.request({
-    hostname: 'api.mexc.com',
-    path:     `/api/v3/account?timestamp=${ts}&recvWindow=5000&signature=${sig}`,
-    method:   'GET',
-    headers:  {'X-MEXC-APIKEY': S.apiKey, 'Accept': 'application/json'},
-    timeout:  8000
-  }, res => {
-    let d = '';
-    res.on('data', c => d += c);
-    res.on('end', () => {
-      try {
-        const r = JSON.parse(d);
-        if (r.balances) {
-          const usdt = r.balances.find(b => b.asset === 'USDT');
-          const avail = usdt ? parseFloat(usdt.free).toFixed(4) : '0';
-          log(`✅ MEXC API connection OK! USDT balance: $${avail} (free)`, 'profit');
-          log(`✅ Spot Trade permission confirmed — bot can place real orders`, 'profit');
-          S.mexcBalance = avail;
-        } else if (r.code) {
-          log(`❌ MEXC API test failed: code=${r.code} msg=${r.msg}`, 'err');
-          if (r.code === 700003) log(`❌ Invalid API key — double-check MEXC_KEY in Railway Variables`, 'err');
-          if (r.code === 700006) log(`❌ IP restricted — remove IP whitelist from MEXC API settings`, 'err');
-        }
-      } catch(e) {
-        log(`MEXC test parse error: ${e.message}`, 'err');
-      }
-    });
+  if (side.toUpperCase() === 'BUY') {
+    // Use quoteOrderQty to spend exact USDT amount
+    const usdtAmt = (S.capital / S.maxPos).toFixed(2);
+    params.quoteOrderQty = usdtAmt;
+    log(`💰 MEXC BUY $${usdtAmt} USDT of ${sym}`, 'buy');
+  } else {
+    // Sell quantity of coins (6 decimal places)
+    params.quantity = qty.toFixed(6);
+    log(`💰 MEXC SELL ${params.quantity} ${sym}`, 'sell');
+  }
+
+  mexcRequest('POST', '/api/v3/order', params, S.apiKey, S.apiSecret, (err, r) => {
+    if (err) { log(`MEXC order error: ${err.message}`, 'err'); return; }
+    if (r.orderId) {
+      log(`✅ ORDER FILLED! orderId=${r.orderId} status=${r.status} qty=${r.executedQty}`, 'profit');
+      log(`✅ Check your MEXC Spot wallet — balance has changed`, 'profit');
+    } else {
+      log(`❌ ORDER FAILED code=${r.code} msg=${r.msg}`, 'err');
+      if (r.code==700002||r.code=='700002') log('❌ Signature invalid — check MEXC_KEY & MEXC_SECRET match exactly','err');
+      if (r.code==700003||r.code=='700003') log('❌ Invalid API key — re-copy key from MEXC API Management page','err');
+      if (r.code==700006||r.code=='700006') log('❌ IP whitelist blocking — remove IP restriction from MEXC API key','err');
+      if (r.code==30004 ||r.code=='30004')  log('❌ Insufficient USDT — deposit funds to MEXC Spot wallet','err');
+      if (r.code==2010  ||r.code=='2010')   log('❌ Insufficient balance for this order amount','err');
+    }
   });
-  req.on('error', e => log(`MEXC test error: ${e.message}`, 'err'));
-  req.end();
+}
+
+// ── TEST MEXC CONNECTION ──────────────────────────────────────────────────────
+function testMexcConnection() {
+  if (!S.apiKey || !S.apiSecret) {
+    log('⚠ No API keys in memory', 'err');
+    return;
+  }
+  mexcRequest('GET', '/api/v3/account', {}, S.apiKey, S.apiSecret, (err, r) => {
+    if (err) { log(`MEXC test error: ${err.message}`, 'err'); return; }
+    if (r.balances) {
+      const usdt = r.balances.find(b => b.asset === 'USDT');
+      const bal  = parseFloat(usdt?.free||0).toFixed(4);
+      S.mexcBalance = bal;
+      log(`✅ MEXC VERIFIED! USDT=$${bal} free`, 'profit');
+      log(`✅ Signature is correct — bot can place real orders`, 'profit');
+    } else {
+      log(`❌ Key test: code=${r.code} msg=${r.msg}`, 'err');
+      if (r.code==700002||r.code=='700002') log('❌ Signature invalid — copy keys again from MEXC exactly, no spaces','err');
+      if (r.code==700003||r.code=='700003') log('❌ Invalid API key — re-copy MEXC_KEY from MEXC API Management','err');
+      if (r.code===700006) log('❌ FIX: IP whitelist on — MEXC API key → Edit → remove all IP restrictions','err');
+      if (r.code===10072)  log('❌ FIX: API key not found or deleted on MEXC','err');
+    }
+  });
 }
 
 // ── CORS + JSON HELPER ────────────────────────────────────────────────────────
@@ -757,52 +774,34 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── GET /balance ─────────────────────────────────────────────────────────────
+  // ── /balance ─────────────────────────────────────────────────────────────────
   if (url === '/balance') {
     if (!S.apiKey || !S.apiSecret) {
-      send(res, 400, {error:'No API keys in server memory. Go to Config → enter keys → Save API Keys Permanently', hasKeys:false});
+      send(res, 400, {error:'No API keys in server memory. Go to Config tab → enter MEXC keys → Save API Keys Permanently', hasKeys:false});
       return;
     }
-    const ts   = Date.now().toString();
-    const rawQ = `timestamp=${ts}&recvWindow=5000`;
-    const sig  = crypto.createHmac('sha256', S.apiSecret).update(rawQ).digest('hex');
-    const bReq = https.request({
-      hostname:'api.mexc.com',
-      path:`/api/v3/account?timestamp=${ts}&recvWindow=5000&signature=${sig}`,
-      method:'GET',
-      headers:{'X-MEXC-APIKEY':S.apiKey,'Accept':'application/json','User-Agent':'CryptoBotPro/1.0'},
-      timeout:8000
-    }, r => {
-      let d='';
-      r.on('data', c => d+=c);
-      r.on('end', () => {
-        try {
-          const acc = JSON.parse(d);
-          if (acc.balances) {
-            const usdt = acc.balances.find(b=>b.asset==='USDT');
-            const coinName = S.pair.replace('USDT','');
-            const coin = acc.balances.find(b=>b.asset===coinName);
-            const free = parseFloat(usdt?.free||0).toFixed(4);
-            S.mexcBalance = free;
-            log(`💳 Wallet — USDT: $${free} free | ${coinName}: ${coin?.free||'0'}`, 'profit');
-            send(res, 200, {
-              ok:true,
-              usdt:{free:usdt?.free||'0', locked:usdt?.locked||'0'},
-              coin:{asset:coinName, free:coin?.free||'0', locked:coin?.locked||'0'}
-            });
-          } else {
-            const code = acc.code||0, msg = acc.msg||'Unknown';
-            log(`❌ Balance failed: code=${code} ${msg}`, 'err');
-            if (code===700003||code==='700003') log('❌ FIX: Invalid API key — re-copy MEXC_KEY from MEXC API Management','err');
-            if (code===700006||code==='700006') log('❌ FIX: IP whitelist blocking — remove IP restriction from MEXC API key','err');
-            send(res, 200, {ok:false, error:msg, code});
-          }
-        } catch(e) { send(res, 500, {error:e.message}); }
-      });
+    mexcRequest('GET', '/api/v3/account', {}, S.apiKey, S.apiSecret, (err, acc) => {
+      if (err) { send(res, 500, {error:err.message}); return; }
+      if (acc.balances) {
+        const usdt     = acc.balances.find(b=>b.asset==='USDT');
+        const coinName = S.pair.replace('USDT','');
+        const coin     = acc.balances.find(b=>b.asset===coinName);
+        const free     = parseFloat(usdt?.free||0).toFixed(4);
+        S.mexcBalance  = free;
+        log(`💳 Wallet — USDT: $${free} free | ${coinName}: ${coin?.free||'0'}`, 'profit');
+        send(res, 200, {
+          ok:true,
+          usdt:{free:usdt?.free||'0', locked:usdt?.locked||'0'},
+          coin:{asset:coinName, free:coin?.free||'0', locked:coin?.locked||'0'}
+        });
+      } else {
+        log(`❌ Balance failed: code=${acc.code} msg=${acc.msg}`, 'err');
+        if (acc.code===700002) log('❌ FIX: Signature invalid — copy keys again from MEXC, no spaces','err');
+        if (acc.code===700003) log('❌ FIX: Invalid key — re-copy from MEXC API Management','err');
+        if (acc.code===700006) log('❌ FIX: IP whitelist — remove IP restriction from MEXC API key','err');
+        send(res, 200, {ok:false, error:acc.msg||'Unknown', code:acc.code||0});
+      }
     });
-    bReq.on('error', e=>{log('Balance err:'+e.message,'err');send(res,500,{error:e.message});});
-    bReq.on('timeout', ()=>{bReq.destroy();send(res,500,{error:'MEXC timeout'});});
-    bReq.end();
     return;
   }
 
@@ -846,34 +845,22 @@ const server = http.createServer((req, res) => {
       saveKeys(rawKey, rawSec);
       save();
       log(`Keys saved: ${rawKey.substring(0,6)}••••${rawKey.slice(-4)} (len=${rawKey.length})`, 'info');
-      // Immediately test keys
-      const ts   = Date.now().toString();
-      const rawQ = `timestamp=${ts}&recvWindow=5000`;
-      const sig  = crypto.createHmac('sha256', rawSec).update(rawQ).digest('hex');
-      https.request({
-        hostname:'api.mexc.com',
-        path:`/api/v3/account?timestamp=${ts}&recvWindow=5000&signature=${sig}`,
-        method:'GET',
-        headers:{'X-MEXC-APIKEY':rawKey,'Accept':'application/json','User-Agent':'CryptoBotPro/1.0'},
-        timeout:8000
-      }, r => {
-        let rd=''; r.on('data',c=>rd+=c);
-        r.on('end',()=>{
-          try {
-            const acc = JSON.parse(rd);
-            if (acc.balances) {
-              const usdt = acc.balances.find(b=>b.asset==='USDT');
-              const bal  = parseFloat(usdt?.free||0).toFixed(4);
-              S.mexcBalance = bal;
-              log(`✅ MEXC KEYS VERIFIED! USDT balance: $${bal} — real orders will work`, 'profit');
-            } else {
-              log(`❌ Key test failed: code=${acc.code} msg=${acc.msg}`, 'err');
-              if (acc.code===700003||acc.code==='700003') log('❌ FIX: Wrong API key — re-copy from MEXC API Management page','err');
-              if (acc.code===700006||acc.code==='700006') log('❌ FIX: IP whitelist on — go to MEXC → API Management → remove IP restriction','err');
-            }
-          } catch(e) { log('Key test err:'+e.message,'err'); }
-        });
-      }).on('error', e=>log('Key test net err:'+e.message,'err')).end();
+      // Immediately test keys using the same signing helper
+      mexcRequest('GET', '/api/v3/account', {}, rawKey, rawSec, (err, acc) => {
+        if (err) { log(`Key test error: ${err.message}`, 'err'); return; }
+        if (acc.balances) {
+          const usdt = acc.balances.find(b=>b.asset==='USDT');
+          const bal  = parseFloat(usdt?.free||0).toFixed(4);
+          S.mexcBalance = bal;
+          log(`✅ MEXC KEYS VERIFIED! USDT balance: $${bal} — signature is correct`, 'profit');
+          log(`✅ Bot will place real orders on next live signal`, 'profit');
+        } else {
+          log(`❌ Key test FAILED: code=${acc.code} msg=${acc.msg}`, 'err');
+          if (acc.code==700002||acc.code=='700002') log('❌ Signature invalid — try saving keys again. Make sure no spaces in key/secret','err');
+          if (acc.code==700003||acc.code=='700003') log('❌ Invalid key — re-copy Access Key from MEXC API Management exactly','err');
+          if (acc.code==700006||acc.code=='700006') log('❌ IP whitelist blocking — MEXC API Management → your key → remove IP restriction','err');
+        }
+      });
 
       send(res, 200, {ok:true, keyLength:rawKey.length, secLength:rawSec.length,
         msg:'Keys saved. Testing with MEXC — check Server Log in 5 seconds.'});
