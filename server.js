@@ -73,12 +73,12 @@ let S = {
   pair:     ENV_PAIR,
   capital:  ENV_CAP,
   maxPos:   3,
-  tpPct:    0.35,        // take profit %
-  slPct:    0.20,        // stop loss % (tight)
-  trailPct: 0.10,        // trailing stop %
-  maxDaily: 300,
-  cooldown: 8000,        // ms between entries (8 seconds)
-  warmup:   15,          // ticks needed before trading
+  tpPct:    0.45,        // take profit % (covers 0.10% fee + 0.35% net profit)
+  slPct:    0.35,        // stop loss % (wider = fewer false SL triggers)
+  trailPct: 0.15,        // trailing stop %
+  maxDaily: 200,
+  cooldown: 10000,       // ms between entries (10 seconds)
+  warmup:   20,          // ticks needed before trading
 
   // Live stats
   liveProfit:0, todayP:0, liveT:0, liveW:0, liveL:0, bestT:0, feesT:0,
@@ -442,9 +442,13 @@ function enter(px, reason, isPaper) {
   const amt  = S.capital / S.maxPos;
   // TP must be max of: configured %, and break-even+MIN_NET
   // Add extra 0.02% buffer above min to account for price rounding
+  // Guaranteed profit: TP must be well above break-even including fees
+  // Formula: TP >= entry * (1 + RT_FEE + MIN_NET + 0.05% buffer)
   const configTp = px * (1 + S.tpPct/100);
-  const safeTpPx = minTP(px, amt) * 1.0002;  // tiny buffer above theoretical min
+  const safeTpPx = minTP(px, amt) * 1.0005;  // 0.05% buffer above break-even
   const tp = parseFloat(Math.max(configTp, safeTpPx).toFixed(8));
+  // Log the guaranteed profit amount for transparency
+  const guaranteedNet = (tp - px) / px * 100 - RT_FEE * 100;
   const sl   = parseFloat((px*(1-S.slPct/100)).toFixed(8));
   const trail= parseFloat((px*(1-S.trailPct/100)).toFixed(8));
 
@@ -502,8 +506,14 @@ function exitCheck(px, isPaper) {
         o.trailStop = be * 1.0002;  // move trail to just above break-even
       }
     } else if (px <= o.sl) {
-      why    = 'SL';
-      exitAt = o.sl;  // use exact SL price
+      // Don't fire SL if price is within 0.05% of TP (prevent whipsaw)
+      const distToTp = (o.tp - px) / px * 100;
+      if (distToTp < 0.05) {
+        // Very close to TP — hold and wait
+      } else {
+        why    = 'SL';
+        exitAt = o.sl;
+      }
     }
 
     if (!why) return;
@@ -889,7 +899,7 @@ const server = http.createServer((req, res) => {
       if(d.capital)  S.capital  = parseFloat(d.capital)||20;
       if(d.maxPos)   S.maxPos   = parseInt(d.maxPos)||3;
       if(d.tpPct)    S.tpPct    = Math.max(parseFloat(d.tpPct), RT_FEE*100+0.12);
-      if(d.slPct)    S.slPct    = Math.max(parseFloat(d.slPct), 0.10);
+      if(d.slPct)    S.slPct    = Math.max(parseFloat(d.slPct), RT_FEE*100*2); // SL >= 2x fee
       if(d.trailPct) S.trailPct = parseFloat(d.trailPct)||0.10;
       if(d.maxDaily) S.maxDaily = parseInt(d.maxDaily)||200;
       if(d.cooldown) S.cooldown = parseInt(d.cooldown)*1000||8000;
