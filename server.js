@@ -29,10 +29,11 @@ const DATA_FILE = path.join(__dirname, 'bot_state.json');
 const KEYS_FILE = path.join(__dirname, 'bot_keys.enc');
 
 // ── MEXC FEE CONSTANTS ────────────────────────────────────────────────────────
-const TAKER   = 0.0005;           // 0.05% per order
-const RT_FEE  = TAKER * 2;       // 0.10% round-trip (buy + sell)
-const MIN_NET = 0.0012;           // minimum 0.12% net profit after fees
-// So minimum gross TP = RT_FEE + MIN_NET = 0.22%
+const TAKER       = 0.0005;        // Spot: 0.05% taker per order
+const RT_FEE      = TAKER * 2;    // Spot: 0.10% round-trip
+const FUT_TAKER   = 0.0002;        // Futures: 0.02% taker per order (cheaper!)
+const FUT_RT_FEE  = FUT_TAKER * 2; // Futures: 0.04% round-trip
+const MIN_NET     = 0.0008;        // minimum 0.08% net profit after fees
 
 console.log(`\n=== CryptoBot Pro v6 ===`);
 console.log(`Port: ${PORT} | MEXC RT fee: ${(RT_FEE*100).toFixed(2)}%`);
@@ -87,7 +88,28 @@ let S = {
   // Orders & history
   liveOrders:[], papOrders:[], liveTrades:[], papTrades:[],
   log:[], prices:{},
-  lastPx:0, startedAt:null, savedAt:null, lastEntry:0, lastLiveEntry:0, mexcBalance:null
+  lastPx:0, startedAt:null, savedAt:null, lastEntry:0, lastLiveEntry:0, mexcBalance:null,
+
+  // ── FUTURES STATE ──────────────────────────────────────────────────────────
+  futuresOn:    false,          // futures bot running
+  futMode:      'paper',        // 'paper' | 'live'
+  futPair:      'BTC_USDT',     // futures contract symbol
+  futCapital:   20,             // USDT margin per session
+  futMaxPos:    1,              // max concurrent futures positions
+  futLeverage:  3,              // 3x leverage (safe default)
+  futTpPct:     0.40,           // 0.40% TP → after 0.04% fee = 0.36% net
+  futSlPct:     0.30,           // 0.30% SL (tight — leveraged)
+  futStrategy:  'auto',         // same signal engine
+  futMaxDaily:  300,
+  futCooldown:  8000,
+  // Futures stats
+  futProfit:0, futT:0, futW:0, futL:0, futBest:0, futFees:0,
+  futPapProfit:0, futPapT:0, futPapW:0, futPapL:0,
+  futOrders:[],     // live futures positions
+  futPapOrders:[],  // paper futures positions
+  futTrades:[],     // completed futures trades
+  futPapTrades:[],
+  futLastPx:0, futLastEntry:0, futTicks:0
 };
 
 // Seed API keys from environment — always sanitize to remove invisible chars
@@ -680,6 +702,384 @@ function testMexcConnection() {
   });
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// MEXC FUTURES ENGINE
+// Contract: BTC_USDT perpetual | Fee: 0.02% taker | Leverage: 3x default
+// API: contract.mexc.com (separate from spot api.mexc.com)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── FUTURES PRICE FEED ────────────────────────────────────────────────────────
+let futPriceTimer = null;
+let futPX = [], futRsi = [], futEma = [], futBb = [];
+let futTicks = 0;
+
+function startFuturesFeed() {
+  clearInterval(futPriceTimer);
+  futPriceTimer = setInterval(fetchFuturesPrice, 1500);
+  fetchFuturesPrice();
+  log(`Futures feed: MEXC ${S.futPair} every 1.5s`, 'ws');
+}
+
+function stopFuturesFeed() {
+  clearInterval(futPriceTimer);
+  futPriceTimer = null;
+}
+
+async function fetchFuturesPrice() {
+  try {
+    // MEXC futures ticker endpoint
+    const d = await get('contract.mexc.com', `/api/v1/contract/ticker?symbol=${S.futPair}`);
+    // Response: { data: { lastPrice: "77000.0", ... } }
+    const px = parseFloat(d?.data?.lastPrice || d?.data?.last || 0);
+    if (px > 0) {
+      S.futLastPx = px;
+      S.prices[S.futPair] = px;
+      onFuturesTick(px);
+    }
+  } catch(e) {
+    // Fallback: use spot price as proxy (BTC price is same across spot/futures)
+    if (S.lastPx > 0) onFuturesTick(S.lastPx);
+  }
+}
+
+// ── FUTURES TICK ──────────────────────────────────────────────────────────────
+function onFuturesTick(px) {
+  S.futLastPx = px;
+  futTicks++;
+  S.futTicks = futTicks;
+
+  futPX.push(px);  if (futPX.length > 300) futPX.shift();
+  futRsi.push(px); if (futRsi.length > 60)  futRsi.shift();
+  futEma.push(px); if (futEma.length > 60)  futEma.shift();
+  futBb.push(px);  if (futBb.length > 30)   futBb.shift();
+
+  if (!S.futuresOn) return;
+
+  // Exit checks first
+  futExitCheck(px, true);   // paper
+  futExitCheck(px, false);  // live
+
+  if (futTicks < 20) return;  // warmup
+
+  const now = Date.now();
+  if (now - S.futLastEntry < S.futCooldown) return;
+  if (S.futT >= S.futMaxDaily && S.futPapT >= S.futMaxDaily) return;
+
+  // Get signal (reuse same signal engine)
+  const sig = getFuturesSignal(px);
+
+  if (futTicks % 20 === 0) {
+    log(`[FUT T${futTicks}] $${px.toFixed(2)} sig=${sig.signal} ${sig.reason}`, 'info');
+  }
+
+  if (!sig.signal) return;
+
+  // Enter paper futures always
+  const papOpen = S.futPapOrders.filter(o=>o.status==='open').length;
+  if (papOpen < S.futMaxPos) futEnter(px, sig.reason, true);
+
+  // Enter live futures if mode=live and keys exist
+  if (S.futMode === 'live' && S.apiKey && S.apiSecret) {
+    const liveOpen = S.futOrders.filter(o=>o.status==='open').length;
+    if (liveOpen < S.futMaxPos && S.futT < S.futMaxDaily) {
+      const posMargin = S.futCapital / S.futMaxPos;
+      if (posMargin >= 5) {
+        futEnter(px, sig.reason, false);
+        S.futLastEntry = now;
+      }
+    }
+  }
+  S.futLastEntry = now;
+}
+
+// ── FUTURES SIGNAL (Long only — buy dips, ride up) ────────────────────────────
+function getFuturesSignal(px) {
+  if (futPX.length < 10) return {signal:false, reason:'warmup'};
+
+  const strat = S.futStrategy || 'auto';
+  // Reuse same indicators on futures price buffer
+  const raw = futPX;
+  const r14 = calcRSI(raw, 14);
+  const r9  = calcRSI(raw, 9);
+  const e9  = calcEMA(raw, Math.min(9, raw.length));
+  const e21 = calcEMA(raw, Math.min(21, raw.length));
+  const bb  = calcBB(raw, Math.min(20, raw.length));
+  const n   = raw.length;
+  const ch1 = n>1 ? (px-raw[n-2])/raw[n-2]*100 : 0;
+  const hi10 = Math.max(...raw.slice(-10));
+  const dip  = (px-hi10)/hi10*100;
+
+  let score = 0, reasons = [];
+  if (r14 !== null && r14 < 45) { score++; reasons.push(`rsi=${r14.toFixed(0)}`); }
+  if (dip <= -0.04 && dip >= -0.8 && ch1 >= 0) { score++; reasons.push(`dip=${dip.toFixed(3)}%`); }
+  if (bb && px <= bb.lower * 1.003 && ch1 >= 0) { score++; reasons.push('bb'); }
+  if (e9 && e21 && e9 > e21 && px < e9) { score++; reasons.push('ema'); }
+  const strong = (dip <= -0.10 || (r14!==null&&r14<38)) && ch1 >= 0;
+
+  const ok = score >= 2 || strong;
+  return {
+    signal: ok,
+    reason: `score=${score}/4 ${reasons.join(' ')} strong=${strong}`
+  };
+}
+
+// ── FUTURES FEE MATH ──────────────────────────────────────────────────────────
+// Futures: fee charged on notional value (margin × leverage)
+// Open fee  = notional × FUT_TAKER
+// Close fee = notional × FUT_TAKER
+// Net = (exitPx - entryPx) / entryPx × notional - openFee - closeFee
+function futFeeMath(entryPx, exitPx, marginUsdt, leverage) {
+  const notional  = marginUsdt * leverage;         // total position value
+  const contracts = notional / entryPx;            // BTC amount
+  const pnl       = (exitPx - entryPx) * contracts; // gross P&L
+  const openFee   = notional * FUT_TAKER;
+  const closeFee  = (exitPx / entryPx) * notional * FUT_TAKER;
+  const fee       = openFee + closeFee;
+  const net       = pnl - fee;
+  return {net, fee, pnl, contracts, notional};
+}
+
+function futBreakEven(entryPx, marginUsdt, leverage) {
+  // Break-even: where net = 0
+  // (exitPx - entryPx) * contracts = openFee + closeFee
+  // Approximate: exitPx ≈ entryPx * (1 + FUT_RT_FEE)
+  return entryPx * (1 + FUT_RT_FEE + 0.0001);
+}
+
+function futMinTP(entryPx, marginUsdt, leverage) {
+  return entryPx * (1 + FUT_RT_FEE + MIN_NET);
+}
+
+// ── ENTER FUTURES POSITION ────────────────────────────────────────────────────
+function futEnter(px, reason, isPaper) {
+  const margin = S.futCapital / S.futMaxPos;
+  const lev    = S.futLeverage;
+
+  // Fee-safe TP
+  const configTp = px * (1 + S.futTpPct/100);
+  const safeTp   = futMinTP(px, margin, lev) * 1.0002;
+  const tp       = parseFloat(Math.max(configTp, safeTp).toFixed(4));
+  const sl       = parseFloat((px * (1 - S.futSlPct/100)).toFixed(4));
+
+  const notional = margin * lev;
+  const expectedNet = futFeeMath(px, tp, margin, lev).net;
+
+  const o = {
+    id: Date.now()+(isPaper?1:0),
+    status: 'open',
+    isPaper, isFutures: true,
+    direction: 'LONG',
+    entryPx: px,
+    margin, leverage: lev,
+    notional,
+    tp, sl,
+    openAt: new Date().toISOString().slice(11,19),
+    reason
+  };
+
+  if (isPaper) {
+    S.futPapOrders.push(o);
+    log(`📝 FUT-PAPER LONG @ $${px.toFixed(2)} | margin=$${margin.toFixed(2)} lev=${lev}x notional=$${notional.toFixed(2)} TP=$${tp.toFixed(2)} SL=$${sl.toFixed(2)} | expected +$${expectedNet.toFixed(4)}`, 'buy');
+  } else {
+    S.futOrders.push(o);
+    log(`🚀 FUT-LIVE LONG @ $${px.toFixed(2)} | margin=$${margin.toFixed(2)} lev=${lev}x notional=$${notional.toFixed(2)} TP=$${tp.toFixed(2)} SL=$${sl.toFixed(2)} | expected +$${expectedNet.toFixed(4)}`, 'buy');
+    futPlaceOrder('open_long', margin, lev, px);
+  }
+}
+
+// ── FUTURES EXIT CHECK ────────────────────────────────────────────────────────
+function futExitCheck(px, isPaper) {
+  const orders = isPaper ? S.futPapOrders : S.futOrders;
+  let changed = false;
+
+  orders.forEach(o => {
+    if (o.status !== 'open') return;
+
+    let why = null, exitAt = px;
+
+    if (px >= o.tp)      { why = 'TP'; exitAt = o.tp; }
+    else if (px <= o.sl) { why = 'SL'; exitAt = o.sl; }
+
+    if (!why) return;
+
+    const {net, fee, pnl} = futFeeMath(o.entryPx, exitAt, o.margin, o.leverage);
+    o.status = 'closed';
+    changed  = true;
+
+    const movePct = ((exitAt - o.entryPx) / o.entryPx * 100).toFixed(3);
+    const leveragedPct = (parseFloat(movePct) * o.leverage).toFixed(3);
+
+    const tr = {
+      n: isPaper ? ++S.futPapT : ++S.futT,
+      time: new Date().toISOString().slice(11,19),
+      pair: S.futPair, direction:'LONG', isPaper,
+      side: why, entryPx: o.entryPx, exitPx: exitAt,
+      margin: o.margin, leverage: o.leverage,
+      notional: o.notional,
+      move: movePct+'%', leveragedMove: leveragedPct+'%',
+      fee: +fee.toFixed(6), pnl: +pnl.toFixed(6), net: +net.toFixed(6)
+    };
+
+    if (isPaper) {
+      S.futPapProfit += net; S.futFees += fee;
+      if(net>=0){S.futPapW++;} else S.futPapL++;
+      S.futPapTrades.unshift(tr);
+      if(S.futPapTrades.length>200) S.futPapTrades.length=200;
+      log(`📝 FUT-PAPER ${why} @ $${exitAt.toFixed(2)} | move=${movePct}% (${leveragedPct}% with ${o.leverage}x) | pnl=$${pnl.toFixed(4)} fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`, net>=0?'profit':'err');
+    } else {
+      S.futProfit += net; S.futFees += fee;
+      if(net>=0){S.futW++; if(net>S.futBest)S.futBest=net;} else S.futL++;
+      S.futTrades.unshift(tr);
+      if(S.futTrades.length>200) S.futTrades.length=200;
+      log(`🚀 FUT-LIVE ${why} @ $${exitAt.toFixed(2)} | move=${movePct}% (${leveragedPct}% lev) | NET=${net>=0?'+':''}$${net.toFixed(4)}`, net>=0?'sell':'err');
+      if(net>0) log(`✅ FUT PROFIT: +$${net.toFixed(4)} USDT (margin=$${o.margin.toFixed(2)} ${o.leverage}x lev)`, 'profit');
+      futPlaceOrder('close_long', o.margin, o.leverage, exitAt);
+    }
+    save();
+  });
+
+  if (changed) {
+    if (isPaper) S.futPapOrders = S.futPapOrders.filter(o=>o.status==='open');
+    else         S.futOrders    = S.futOrders.filter(o=>o.status==='open');
+  }
+}
+
+// ── FUTURES ORDER PLACEMENT (MEXC Perpetual API) ──────────────────────────────
+// MEXC Futures API: contract.mexc.com
+// Signing: HMAC-SHA256(apiKey + timestamp + params)
+// Params for POST: JSON body string
+function futPlaceOrder(action, marginUsdt, leverage, px) {
+  if (!S.apiKey || !S.apiSecret) {
+    log('Futures: no API keys', 'err');
+    return;
+  }
+
+  const ts  = Date.now().toString();
+  const sym = S.futPair; // e.g. BTC_USDT
+
+  // Calculate number of contracts
+  // MEXC BTC_USDT: 1 contract = 0.0001 BTC
+  // Notional = contracts × 0.0001 × price = marginUsdt × leverage
+  const notional  = marginUsdt * leverage;
+  const contracts = Math.floor(notional / (0.0001 * px));
+
+  if (contracts < 1) {
+    log(`Futures: too small — contracts=${contracts} (need ≥1). Increase capital or leverage.`, 'err');
+    return;
+  }
+
+  // side: 1=open long, 2=close long, 3=open short, 4=close short
+  const side = action === 'open_long' ? 1 : 2;
+
+  const body = {
+    symbol:   sym,
+    price:    0,          // 0 = market order
+    vol:      contracts,
+    side:     side,
+    type:     5,          // 5 = market order
+    openType: 1,          // 1 = isolated margin
+    leverage: leverage
+  };
+
+  const bodyStr = JSON.stringify(body);
+
+  // MEXC Futures signature: HMAC-SHA256(apiKey + timestamp + bodyString)
+  const sigInput = S.apiKey + ts + bodyStr;
+  const signature = crypto.createHmac('sha256', S.apiSecret).update(sigInput).digest('hex');
+
+  const headers = {
+    'ApiKey':       S.apiKey,
+    'Request-Time': ts,
+    'Signature':    signature,
+    'Content-Type': 'application/json',
+    'Accept':       'application/json'
+  };
+
+  log(`🚀 Futures order: ${action} ${contracts} contracts ${sym} @ market (notional~$${notional.toFixed(2)})`, 'buy');
+
+  const req = https.request({
+    hostname: 'contract.mexc.com',
+    path:     '/api/v1/private/order/submit',
+    method:   'POST',
+    headers,
+    timeout:  8000
+  }, res => {
+    let d = '';
+    res.on('data', c => d += c);
+    res.on('end', () => {
+      try {
+        const r = JSON.parse(d);
+        if (r.success) {
+          log(`✅ Futures order filled! orderId=${r.data} action=${action} contracts=${contracts}`, 'profit');
+          log(`✅ Check MEXC Futures wallet — margin changed by $${marginUsdt.toFixed(2)}`, 'profit');
+        } else {
+          log(`❌ Futures order failed: code=${r.code} msg=${r.message||r.msg}`, 'err');
+          if (r.code === 1002) log('❌ FUT FIX: Futures permission not enabled — MEXC API key needs Futures permission', 'err');
+          if (r.code === 4001) log('❌ FUT FIX: Insufficient futures margin — transfer USDT to Futures wallet on MEXC', 'err');
+          if (r.code === 1003) log('❌ FUT FIX: Invalid signature for futures API', 'err');
+        }
+      } catch(e) {
+        log(`Futures parse err: ${e.message} raw=${d.substring(0,150)}`, 'err');
+      }
+    });
+  });
+  req.on('error', e => log(`Futures net err: ${e.message}`, 'err'));
+  req.on('timeout', () => { req.destroy(); log('Futures timeout', 'err'); });
+  req.write(bodyStr);
+  req.end();
+}
+
+// ── FUTURES BALANCE CHECK ─────────────────────────────────────────────────────
+function getFuturesBalance(callback) {
+  if (!S.apiKey || !S.apiSecret) { callback(null, 'No API keys'); return; }
+  const ts  = Date.now().toString();
+  const sig = crypto.createHmac('sha256', S.apiSecret)
+    .update(S.apiKey + ts)
+    .digest('hex');
+  https.request({
+    hostname: 'contract.mexc.com',
+    path:     '/api/v1/private/account/assets',
+    method:   'GET',
+    headers:  {'ApiKey':S.apiKey,'Request-Time':ts,'Signature':sig,'Accept':'application/json'},
+    timeout:  8000
+  }, res => {
+    let d=''; res.on('data',c=>d+=c);
+    res.on('end',()=>{
+      try {
+        const r = JSON.parse(d);
+        if (r.success && r.data) {
+          const usdt = r.data.find ? r.data.find(a=>a.currency==='USDT') : null;
+          callback({
+            availableBalance: usdt?.availableBalance || r.data.availableBalance || '?',
+            equity: usdt?.equity || r.data.equity || '?'
+          }, null);
+        } else {
+          callback(null, `code=${r.code} ${r.message||''}`);
+        }
+      } catch(e) { callback(null, e.message); }
+    });
+  }).on('error', e=>callback(null,e.message)).end();
+}
+
+// ── RSI/EMA/BB helpers (shared with spot) ─────────────────────────────────────
+function calcRSI(arr, n=14) {
+  if(arr.length<n+1) return 50;
+  const sl=arr.slice(-(n+1));let g=0,l=0;
+  for(let i=1;i<sl.length;i++){const d=sl[i]-sl[i-1];if(d>0)g+=d;else l-=d;}
+  const al=l/n;if(al===0)return 100;return 100-(100/(1+(g/n)/al));
+}
+function calcEMA(arr,n){
+  if(arr.length<n)return arr[arr.length-1]||0;
+  const k=2/(n+1);let e=arr.slice(0,n).reduce((a,b)=>a+b,0)/n;
+  for(let i=n;i<arr.length;i++)e=arr[i]*k+e*(1-k);return e;
+}
+function calcBB(arr,n=20){
+  if(arr.length<n)return null;
+  const sl=arr.slice(-n),m=sl.reduce((a,b)=>a+b,0)/n;
+  const sd=Math.sqrt(sl.reduce((a,b)=>a+(b-m)**2,0)/n);
+  return{upper:m+2*sd,middle:m,lower:m-2*sd};
+}
+
 // ── CORS + JSON HELPER ────────────────────────────────────────────────────────
 function setHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin','*');
@@ -770,6 +1170,20 @@ const server = http.createServer((req, res) => {
       log:S.log.slice(0,150),
       hasApiKeys:!!(S.apiKey&&S.apiSecret), mexcBalance:S.mexcBalance||null,
       startedAt:S.startedAt, savedAt:S.savedAt, feeRt:RT_FEE*100,
+      // Futures status
+      futuresOn:S.futuresOn, futMode:S.futMode, futPair:S.futPair,
+      futCapital:S.futCapital, futMaxPos:S.futMaxPos, futLeverage:S.futLeverage,
+      futTpPct:S.futTpPct, futSlPct:S.futSlPct, futLastPx:S.futLastPx,
+      futFeeRt: FUT_RT_FEE*100,
+      futProfit:S.futProfit, futT:S.futT, futW:S.futW, futL:S.futL, futBest:S.futBest, futFees:S.futFees,
+      futWR: S.futT>0?Math.round(S.futW/S.futT*100):0,
+      futPapProfit:S.futPapProfit, futPapT:S.futPapT, futPapW:S.futPapW, futPapL:S.futPapL,
+      futPapWR: S.futPapT>0?Math.round(S.futPapW/S.futPapT*100):0,
+      futOrders:  S.futOrders.filter(o=>o.status==='open').map(o=>({...o, livePnl:futFeeMath(o.entryPx,S.futLastPx||S.lastPx,o.margin,o.leverage).net})),
+      futPapOrders: S.futPapOrders.filter(o=>o.status==='open').map(o=>({...o, livePnl:futFeeMath(o.entryPx,S.futLastPx||S.lastPx,o.margin,o.leverage).net})),
+      futTrades:    S.futTrades.slice(0,50),
+      futPapTrades: S.futPapTrades.slice(0,50),
+      futTicks:     S.futTicks||0,
       indicators:I?{
         rsi14:I.rsi14.toFixed(1), rsi9:I.rsi9.toFixed(1),
         e9:I.e9.toFixed(4), e21:I.e21.toFixed(4),
@@ -964,6 +1378,60 @@ const server = http.createServer((req, res) => {
       save(); send(res, 200, {ok:true}); return;
     }
 
+    // /startfutures
+    if (url === '/startfutures') {
+      if (S.futuresOn) { send(res,200,{ok:true,msg:'Futures already running'}); return; }
+      S.futuresOn=true; S.futOrders=[]; S.futPapOrders=[]; S.futLastEntry=0;
+      futPX=[]; futRsi=[]; futEma=[]; futBb=[]; futTicks=0;
+      startFuturesFeed();
+      log(`🚀 FUTURES STARTED: ${S.futPair} ${S.futLeverage}x lev margin=$${S.futCapital} tp=${S.futTpPct}% sl=${S.futSlPct}% mode=${S.futMode}`, 'buy');
+      log(`📊 Fee: ${(FUT_RT_FEE*100).toFixed(2)}% RT | TP net expected: ~${(S.futTpPct-FUT_RT_FEE*100).toFixed(2)}%`, 'info');
+      save(); send(res,200,{ok:true}); return;
+    }
+
+    // /stopfutures
+    if (url === '/stopfutures') {
+      S.futuresOn=false; S.futOrders=[]; S.futPapOrders=[];
+      stopFuturesFeed();
+      log('■ Futures stopped.', 'info');
+      save(); send(res,200,{ok:true}); return;
+    }
+
+    // /configfutures
+    if (url === '/configfutures') {
+      if(d.futPair)     S.futPair     = d.futPair;
+      if(d.futCapital)  S.futCapital  = parseFloat(d.futCapital)||20;
+      if(d.futMaxPos)   S.futMaxPos   = parseInt(d.futMaxPos)||1;
+      if(d.futLeverage) S.futLeverage = Math.min(parseInt(d.futLeverage)||3, 10); // max 10x
+      if(d.futTpPct)    S.futTpPct    = Math.max(parseFloat(d.futTpPct), FUT_RT_FEE*100+0.08);
+      if(d.futSlPct)    S.futSlPct    = Math.max(parseFloat(d.futSlPct), 0.10);
+      if(d.futMode)     S.futMode     = d.futMode;
+      if(d.futStrategy) S.futStrategy = d.futStrategy;
+      if(d.futMaxDaily) S.futMaxDaily = parseInt(d.futMaxDaily)||300;
+      if(d.futCooldown) S.futCooldown = parseInt(d.futCooldown)*1000||8000;
+      const posMargin = S.futCapital/S.futMaxPos;
+      const notional  = posMargin * S.futLeverage;
+      log(`Futures config: ${S.futPair} lev=${S.futLeverage}x margin=$${posMargin.toFixed(2)} notional=$${notional.toFixed(2)} tp=${S.futTpPct}% sl=${S.futSlPct}% mode=${S.futMode}`, 'info');
+      save(); send(res,200,{ok:true, posMargin, notional, futTpPct:S.futTpPct}); return;
+    }
+
+    // /futuresbalance
+    if (url === '/futuresbalance') {
+      getFuturesBalance((data, err) => {
+        if (err) { send(res,200,{ok:false,error:err}); return; }
+        log(`💳 Futures wallet — available: $${data.availableBalance} equity: $${data.equity}`, 'profit');
+        send(res,200,{ok:true, ...data});
+      }); return;
+    }
+
+    // /resetfutures
+    if (url === '/resetfutures') {
+      S.futProfit=0;S.futT=0;S.futW=0;S.futL=0;S.futBest=0;S.futFees=0;
+      S.futPapProfit=0;S.futPapT=0;S.futPapW=0;S.futPapL=0;
+      S.futTrades=[];S.futPapTrades=[];S.futOrders=[];S.futPapOrders=[];
+      save(); send(res,200,{ok:true}); return;
+    }
+
     send(res, 404, {error:'Not found: '+url});
   });
 });
@@ -992,7 +1460,7 @@ server.listen(PORT, '0.0.0.0', () => {
     S.botOn = true;
     S.liveOrders=[]; S.papOrders=[];
     PX=[]; ticks=0;
-    log('▶ Auto-resuming bot from saved state...','buy');
+    log('▶ Auto-resuming spot bot...','buy');
     startFeed();
   } else {
     log('Bot ready. Press Start to begin trading.','info');
