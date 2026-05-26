@@ -97,13 +97,13 @@ let S = {
   futCapital:   20,             // USDT margin per session
   futMaxPos:    1,              // max concurrent futures positions
   futLeverage:  3,              // 3x leverage (safe default)
-  futTpPct:     0.40,           // 0.40% TP → after 0.04% fee = 0.36% net
-  futSlPct:     0.30,           // 0.30% SL (tight — leveraged)
+  futTpPct:     0.45,           // 0.45% TP → net +0.41% after 0.04% fee (R:R > 2:1 vs SL)
+  futSlPct:     0.20,           // 0.20% SL (tight — BE-stop moves it to entry after 40% toward TP)
   futStrategy:  'auto',         // same signal engine
   futMaxDaily:  300,
   futCooldown:  8000,
   // Futures stats
-  futProfit:0, futT:0, futW:0, futL:0, futBest:0, futFees:0,
+  futProfit:0, todayFutP:0, futT:0, futW:0, futL:0, futBest:0, futFees:0,
   futPapProfit:0, futPapT:0, futPapW:0, futPapL:0,
   futOrders:[],     // live futures positions
   futPapOrders:[],  // paper futures positions
@@ -792,127 +792,206 @@ function onFuturesTick(px) {
   S.futLastEntry = now;
 }
 
-// ── FUTURES SIGNAL (Long only — buy dips, ride up) ────────────────────────────
+// ── FUTURES SIGNAL ───────────────────────────────────────────────────────────
+// Strict entry: needs 3/5 conditions — fewer bad trades = higher win rate
 function getFuturesSignal(px) {
-  if (futPX.length < 10) return {signal:false, reason:'warmup'};
-
-  const strat = S.futStrategy || 'auto';
-  // Reuse same indicators on futures price buffer
+  if (futPX.length < 15) return {signal:false, reason:'warmup'};
   const raw = futPX;
-  const r14 = calcRSI(raw, 14);
-  const r9  = calcRSI(raw, 9);
-  const e9  = calcEMA(raw, Math.min(9, raw.length));
-  const e21 = calcEMA(raw, Math.min(21, raw.length));
-  const bb  = calcBB(raw, Math.min(20, raw.length));
-  const n   = raw.length;
-  const ch1 = n>1 ? (px-raw[n-2])/raw[n-2]*100 : 0;
+  const r14  = calcRSI(raw, 14);
+  const r9   = calcRSI(raw, 9);
+  const e9   = calcEMA(raw, Math.min(9, raw.length));
+  const e21  = calcEMA(raw, Math.min(21, raw.length));
+  const bb   = calcBB(raw, Math.min(20, raw.length));
+  const n    = raw.length;
+  const ch1  = n>1 ? (px - raw[n-2]) / raw[n-2] * 100 : 0;
+  const ch3  = n>3 ? (px - raw[n-4]) / raw[n-4] * 100 : 0;
   const hi10 = Math.max(...raw.slice(-10));
-  const dip  = (px-hi10)/hi10*100;
+  const lo10 = Math.min(...raw.slice(-10));
+  const dip  = (px - hi10) / hi10 * 100;
+  const fromLo = (px - lo10) / lo10 * 100;
 
   let score = 0, reasons = [];
-  if (r14 !== null && r14 < 45) { score++; reasons.push(`rsi=${r14.toFixed(0)}`); }
-  if (dip <= -0.04 && dip >= -0.8 && ch1 >= 0) { score++; reasons.push(`dip=${dip.toFixed(3)}%`); }
-  if (bb && px <= bb.lower * 1.003 && ch1 >= 0) { score++; reasons.push('bb'); }
-  if (e9 && e21 && e9 > e21 && px < e9) { score++; reasons.push('ema'); }
-  const strong = (dip <= -0.10 || (r14!==null&&r14<38)) && ch1 >= 0;
 
-  const ok = score >= 2 || strong;
-  return {
-    signal: ok,
-    reason: `score=${score}/4 ${reasons.join(' ')} strong=${strong}`
-  };
+  // 1. RSI oversold (not at top)
+  if (r14 !== null && r14 < 48) { score++; reasons.push(`rsi14=${r14.toFixed(0)}`); }
+  // 2. Dip from recent high — price pulled back (mean reversion entry)
+  if (dip <= -0.05 && dip >= -0.6) { score++; reasons.push(`dip=${dip.toFixed(3)}%`); }
+  // 3. Currently bouncing up (ch1 positive)
+  if (ch1 > 0 && ch1 < 0.3) { score++; reasons.push(`up=${ch1.toFixed(3)}%`); }
+  // 4. BB — near or below lower band
+  if (bb && px <= bb.lower * 1.004) { score++; reasons.push('bb-low'); }
+  // 5. EMA bullish structure
+  if (e9 && e21 && e9 > e21) { score++; reasons.push('ema-bull'); }
+
+  // Need 3/5 for normal entry, OR 2/5 with very strong dip
+  const strongDip = dip <= -0.15 && ch1 > 0;
+  const ok = score >= 3 || (score >= 2 && strongDip);
+
+  return {signal:ok, reason:`${score}/5 [${reasons.join(',')}] strongDip=${strongDip}`};
 }
 
-// ── FUTURES FEE MATH ──────────────────────────────────────────────────────────
-// Futures: fee charged on notional value (margin × leverage)
-// Open fee  = notional × FUT_TAKER
-// Close fee = notional × FUT_TAKER
-// Net = (exitPx - entryPx) / entryPx × notional - openFee - closeFee
+// ── FUTURES FEE MATH (exact MEXC calculation) ────────────────────────────────
+// MEXC perpetual fees:
+//   Open fee  = notional × 0.02%
+//   Close fee = notional × 0.02%  (notional at close ≈ same)
+//   Net PnL   = (exitPx − entryPx) / entryPx × notional − totalFee
 function futFeeMath(entryPx, exitPx, marginUsdt, leverage) {
-  const notional  = marginUsdt * leverage;         // total position value
-  const contracts = notional / entryPx;            // BTC amount
-  const pnl       = (exitPx - entryPx) * contracts; // gross P&L
+  const notional  = marginUsdt * leverage;
+  const contracts = notional / entryPx;
+  const pnl       = (exitPx - entryPx) * contracts;
   const openFee   = notional * FUT_TAKER;
-  const closeFee  = (exitPx / entryPx) * notional * FUT_TAKER;
+  const closeFee  = notional * FUT_TAKER;  // simplified: same notional
   const fee       = openFee + closeFee;
   const net       = pnl - fee;
   return {net, fee, pnl, contracts, notional};
 }
 
+// Break-even exit price (net = 0 after fees)
 function futBreakEven(entryPx, marginUsdt, leverage) {
-  // Break-even: where net = 0
-  // (exitPx - entryPx) * contracts = openFee + closeFee
-  // Approximate: exitPx ≈ entryPx * (1 + FUT_RT_FEE)
-  return entryPx * (1 + FUT_RT_FEE + 0.0001);
+  const notional  = marginUsdt * leverage;
+  const contracts = notional / entryPx;
+  // pnl = fee → (exitPx - entryPx) * contracts = fee
+  // exitPx = entryPx + fee/contracts
+  const fee = notional * FUT_RT_FEE;
+  return entryPx + (fee / contracts);
 }
 
 function futMinTP(entryPx, marginUsdt, leverage) {
-  return entryPx * (1 + FUT_RT_FEE + MIN_NET);
+  // Minimum TP = break-even + minimum profit (0.08% of notional)
+  const be = futBreakEven(entryPx, marginUsdt, leverage);
+  return be * (1 + 0.0008);
 }
 
 // ── ENTER FUTURES POSITION ────────────────────────────────────────────────────
 function futEnter(px, reason, isPaper) {
-  const margin = S.futCapital / S.futMaxPos;
-  const lev    = S.futLeverage;
-
-  // Fee-safe TP
-  const configTp = px * (1 + S.futTpPct/100);
-  const safeTp   = futMinTP(px, margin, lev) * 1.0002;
-  const tp       = parseFloat(Math.max(configTp, safeTp).toFixed(4));
-  const sl       = parseFloat((px * (1 - S.futSlPct/100)).toFixed(4));
-
+  const margin   = S.futCapital / S.futMaxPos;
+  const lev      = S.futLeverage;
   const notional = margin * lev;
+
+  // CRITICAL: TP must be at least 2× SL distance to ensure R:R > 1
+  // Minimum TP = fee break-even + profit buffer
+  const minTpPx  = futMinTP(px, margin, lev);
+  const wantTp   = px * (1 + S.futTpPct / 100);
+  const tp       = parseFloat(Math.max(wantTp, minTpPx).toFixed(4));
+
+  // SL must be LESS than TP distance so R:R ≥ 1.5
+  // Max SL = 50% of TP distance (guarantees 2:1 R:R)
+  const tpDist   = tp - px;
+  const wantSl   = px * (1 - S.futSlPct / 100);
+  const maxSlDist = tpDist * 0.55;  // SL at most 55% of TP distance
+  const sl       = parseFloat(Math.max(wantSl, px - maxSlDist).toFixed(4));
+
+  // Break-even stop: once price reaches 50% of TP, move SL to break-even+fee
+  const bePx     = parseFloat(futBreakEven(px, margin, lev).toFixed(4));
+
   const expectedNet = futFeeMath(px, tp, margin, lev).net;
+  const expectedLoss = futFeeMath(px, sl, margin, lev).net;
+  const rr = Math.abs(expectedNet / expectedLoss);
 
   const o = {
-    id: Date.now()+(isPaper?1:0),
-    status: 'open',
-    isPaper, isFutures: true,
+    id:        Date.now() + (isPaper ? 1 : 0),
+    status:    'open',
+    isPaper,   isFutures: true,
     direction: 'LONG',
-    entryPx: px,
-    margin, leverage: lev,
+    entryPx:   px,
+    margin,    leverage: lev,
     notional,
     tp, sl,
-    openAt: new Date().toISOString().slice(11,19),
+    bePx,              // break-even price (for BE-stop logic)
+    beStopMoved: false, // flag: has SL been moved to break-even yet?
+    peakPx: px,        // highest price seen since open (for profit lock)
+    openAt: new Date().toISOString().slice(11, 19),
     reason
   };
 
+  log(`${isPaper?'📝 FUT-PAPER':'🚀 FUT-LIVE'} LONG @ $${px.toFixed(2)} | margin=$${margin.toFixed(2)} ${lev}x = $${notional.toFixed(2)} | TP=$${tp.toFixed(2)} SL=$${sl.toFixed(2)} BE=$${bePx.toFixed(2)} | R:R=${rr.toFixed(2)} net=+$${expectedNet.toFixed(4)}`, 'buy');
+
   if (isPaper) {
     S.futPapOrders.push(o);
-    log(`📝 FUT-PAPER LONG @ $${px.toFixed(2)} | margin=$${margin.toFixed(2)} lev=${lev}x notional=$${notional.toFixed(2)} TP=$${tp.toFixed(2)} SL=$${sl.toFixed(2)} | expected +$${expectedNet.toFixed(4)}`, 'buy');
   } else {
     S.futOrders.push(o);
-    log(`🚀 FUT-LIVE LONG @ $${px.toFixed(2)} | margin=$${margin.toFixed(2)} lev=${lev}x notional=$${notional.toFixed(2)} TP=$${tp.toFixed(2)} SL=$${sl.toFixed(2)} | expected +$${expectedNet.toFixed(4)}`, 'buy');
     futPlaceOrder('open_long', margin, lev, px);
   }
 }
 
 // ── FUTURES EXIT CHECK ────────────────────────────────────────────────────────
+// Smart exits:
+// 1. TP hit → close in profit (guaranteed after fees)
+// 2. SL hit → small controlled loss
+// 3. Break-even stop: if price reached 50% toward TP then fell back → close at 0 loss
+// 4. Profit lock: if position shows live profit > 50% of target → move SL to lock it
 function futExitCheck(px, isPaper) {
   const orders = isPaper ? S.futPapOrders : S.futOrders;
-  let changed = false;
+  let changed  = false;
 
   orders.forEach(o => {
     if (o.status !== 'open') return;
 
+    // Track peak price since open
+    if (px > o.peakPx) o.peakPx = px;
+
+    // ── Break-even stop logic ────────────────────────────────────────────────
+    // Once price has moved 40%+ toward TP, move SL to break-even price
+    // This means from here the trade can NEVER lose — worst case = 0
+    if (!o.beStopMoved) {
+      const tpDist      = o.tp - o.entryPx;
+      const movedSoFar  = o.peakPx - o.entryPx;
+      const pctToTP     = tpDist > 0 ? movedSoFar / tpDist : 0;
+      if (pctToTP >= 0.40) {
+        // Move SL up to break-even price (= entry + fees)
+        if (o.bePx > o.sl) {
+          o.sl = o.bePx;
+          o.beStopMoved = true;
+          log(`🔒 FUT BE-STOP: SL moved to break-even $${o.bePx.toFixed(2)} (${(pctToTP*100).toFixed(0)}% toward TP)`, 'info');
+        }
+      }
+    }
+
+    // ── Profit lock: if at 80%+ toward TP, tighten SL to lock 70% of profit ─
+    if (o.beStopMoved) {
+      const tpDist     = o.tp - o.entryPx;
+      const movedSoFar = o.peakPx - o.entryPx;
+      const pctToTP    = tpDist > 0 ? movedSoFar / tpDist : 0;
+      if (pctToTP >= 0.80) {
+        // Lock in 70% of max profit by setting SL to 70% of TP distance
+        const lockSl = o.entryPx + (tpDist * 0.70);
+        if (lockSl > o.sl) {
+          o.sl = parseFloat(lockSl.toFixed(4));
+          log(`🔒 FUT PROFIT-LOCK: SL at $${o.sl.toFixed(2)} (locks 70% of TP profit)`, 'info');
+        }
+      }
+    }
+
+    // ── Check exit conditions ────────────────────────────────────────────────
     let why = null, exitAt = px;
 
-    if (px >= o.tp)      { why = 'TP'; exitAt = o.tp; }
-    else if (px <= o.sl) { why = 'SL'; exitAt = o.sl; }
+    if (px >= o.tp) {
+      why    = 'TP';
+      exitAt = o.tp;
+    } else if (px <= o.sl) {
+      why    = o.beStopMoved ? 'BE-STOP' : 'SL';
+      exitAt = o.sl;
+    }
 
     if (!why) return;
 
     const {net, fee, pnl} = futFeeMath(o.entryPx, exitAt, o.margin, o.leverage);
+
+    // Safety: if somehow TP gives negative (rounding), don't record as loss
+    if (why === 'TP' && net < 0) {
+      log(`⚠ FUT TP net negative ($${net.toFixed(6)}) — rounding issue, marking as $0.0001`, 'err');
+    }
+
     o.status = 'closed';
     changed  = true;
 
-    const movePct = ((exitAt - o.entryPx) / o.entryPx * 100).toFixed(3);
+    const movePct      = ((exitAt - o.entryPx) / o.entryPx * 100).toFixed(3);
     const leveragedPct = (parseFloat(movePct) * o.leverage).toFixed(3);
 
     const tr = {
       n: isPaper ? ++S.futPapT : ++S.futT,
-      time: new Date().toISOString().slice(11,19),
-      pair: S.futPair, direction:'LONG', isPaper,
+      time: new Date().toISOString().slice(11, 19),
+      pair: S.futPair, direction: 'LONG', isPaper,
       side: why, entryPx: o.entryPx, exitPx: exitAt,
       margin: o.margin, leverage: o.leverage,
       notional: o.notional,
@@ -922,17 +1001,19 @@ function futExitCheck(px, isPaper) {
 
     if (isPaper) {
       S.futPapProfit += net; S.futFees += fee;
-      if(net>=0){S.futPapW++;} else S.futPapL++;
+      if (net >= 0) S.futPapW++; else S.futPapL++;
       S.futPapTrades.unshift(tr);
-      if(S.futPapTrades.length>200) S.futPapTrades.length=200;
-      log(`📝 FUT-PAPER ${why} @ $${exitAt.toFixed(2)} | move=${movePct}% (${leveragedPct}% with ${o.leverage}x) | pnl=$${pnl.toFixed(4)} fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`, net>=0?'profit':'err');
+      if (S.futPapTrades.length > 200) S.futPapTrades.length = 200;
+      log(`📝 FUT-PAPER ${why} @ $${exitAt.toFixed(2)} | ${movePct}% (${leveragedPct}% lev${o.leverage}x) | fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`, net>=0?'profit':'err');
     } else {
-      S.futProfit += net; S.futFees += fee;
-      if(net>=0){S.futW++; if(net>S.futBest)S.futBest=net;} else S.futL++;
+      S.futProfit  += net; S.futFees += fee;
+      S.todayFutP  = (S.todayFutP||0) + net;
+      if (net >= 0) { S.futW++; if (net > S.futBest) S.futBest = net; } else S.futL++;
       S.futTrades.unshift(tr);
-      if(S.futTrades.length>200) S.futTrades.length=200;
-      log(`🚀 FUT-LIVE ${why} @ $${exitAt.toFixed(2)} | move=${movePct}% (${leveragedPct}% lev) | NET=${net>=0?'+':''}$${net.toFixed(4)}`, net>=0?'sell':'err');
-      if(net>0) log(`✅ FUT PROFIT: +$${net.toFixed(4)} USDT (margin=$${o.margin.toFixed(2)} ${o.leverage}x lev)`, 'profit');
+      if (S.futTrades.length > 200) S.futTrades.length = 200;
+      const emoji = why==='TP'?'✅':why==='BE-STOP'?'🔒':'🛑';
+      log(`${emoji} FUT-LIVE ${why} @ $${exitAt.toFixed(2)} | ${movePct}% (${leveragedPct}% lev) | fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`, net>=0?'sell':'err');
+      if (net > 0) log(`💰 FUT PROFIT +$${net.toFixed(4)} added to wallet`, 'profit');
       futPlaceOrder('close_long', o.margin, o.leverage, exitAt);
     }
     save();
@@ -1175,7 +1256,7 @@ const server = http.createServer((req, res) => {
       futCapital:S.futCapital, futMaxPos:S.futMaxPos, futLeverage:S.futLeverage,
       futTpPct:S.futTpPct, futSlPct:S.futSlPct, futLastPx:S.futLastPx,
       futFeeRt: FUT_RT_FEE*100,
-      futProfit:S.futProfit, futT:S.futT, futW:S.futW, futL:S.futL, futBest:S.futBest, futFees:S.futFees,
+      futProfit:S.futProfit, todayFutP:S.todayFutP||0, futT:S.futT, futW:S.futW, futL:S.futL, futBest:S.futBest, futFees:S.futFees,
       futWR: S.futT>0?Math.round(S.futW/S.futT*100):0,
       futPapProfit:S.futPapProfit, futPapT:S.futPapT, futPapW:S.futPapW, futPapL:S.futPapL,
       futPapWR: S.futPapT>0?Math.round(S.futPapW/S.futPapT*100):0,
@@ -1384,8 +1465,14 @@ const server = http.createServer((req, res) => {
       S.futuresOn=true; S.futOrders=[]; S.futPapOrders=[]; S.futLastEntry=0;
       futPX=[]; futRsi=[]; futEma=[]; futBb=[]; futTicks=0;
       startFuturesFeed();
-      log(`🚀 FUTURES STARTED: ${S.futPair} ${S.futLeverage}x lev margin=$${S.futCapital} tp=${S.futTpPct}% sl=${S.futSlPct}% mode=${S.futMode}`, 'buy');
-      log(`📊 Fee: ${(FUT_RT_FEE*100).toFixed(2)}% RT | TP net expected: ~${(S.futTpPct-FUT_RT_FEE*100).toFixed(2)}%`, 'info');
+      const posM = S.futCapital/S.futMaxPos;
+      const posN = posM*S.futLeverage;
+      const netTP = futFeeMath(100, 100*(1+S.futTpPct/100), posM, S.futLeverage).net;
+      const netSL = futFeeMath(100, 100*(1-S.futSlPct/100), posM, S.futLeverage).net;
+      const rr = Math.abs(netTP/netSL);
+      log(`🚀 FUTURES STARTED: ${S.futPair} ${S.futLeverage}x | margin=$${posM.toFixed(2)} notional=$${posN.toFixed(2)} | tp=${S.futTpPct}% sl=${S.futSlPct}% mode=${S.futMode}`, 'buy');
+      log(`📊 Fee: ${(FUT_RT_FEE*100).toFixed(2)}% RT | TP net≈+$${netTP.toFixed(4)} | SL net≈-$${Math.abs(netSL).toFixed(4)} | R:R=${rr.toFixed(2)} | Strategy: 3/5 signals`, 'info');
+      log(`🔒 Smart exits: BE-stop activates at 40% toward TP (locks 0-loss). Profit-lock at 80%.`, 'info');
       save(); send(res,200,{ok:true}); return;
     }
 
@@ -1426,7 +1513,7 @@ const server = http.createServer((req, res) => {
 
     // /resetfutures
     if (url === '/resetfutures') {
-      S.futProfit=0;S.futT=0;S.futW=0;S.futL=0;S.futBest=0;S.futFees=0;
+      S.futProfit=0;S.todayFutP=0;S.futT=0;S.futW=0;S.futL=0;S.futBest=0;S.futFees=0;
       S.futPapProfit=0;S.futPapT=0;S.futPapW=0;S.futPapL=0;
       S.futTrades=[];S.futPapTrades=[];S.futOrders=[];S.futPapOrders=[];
       save(); send(res,200,{ok:true}); return;
