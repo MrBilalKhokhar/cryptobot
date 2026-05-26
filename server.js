@@ -1608,7 +1608,7 @@ const server = http.createServer((req, res) => {
 
   let body = '';
   req.on('data', c => body += c);
-  req.on('end', () => {
+  req.on('end', async () => {
     let d = {};
     try { d = JSON.parse(body); } catch(e) {}
 
