@@ -508,16 +508,46 @@ function exitCheck(px, isPaper) {
   orders.forEach(o => {
     if (o.status !== 'open') return;
 
-    // Simple exits: only TP or SL — no trailing stop
+    // Track peak price and peak net profit seen on this position
+    if (!o.peakPx || px > o.peakPx) o.peakPx = px;
+    const currentNet = feeMath(o.entryPx, px, o.amt).net;
+    if (currentNet > (o.peakNet||0)) o.peakNet = currentNet;
+
+    // ── PROFIT PROTECTION ──────────────────────────────────────────────────
+    // If position was in profit (peakNet > minProfit) and price dropped
+    // giving back more than 60% of peak profit → close now to protect gains
+    const minProfit = o.amt * 0.0008; // minimum $0.0008 per $1 to be worth protecting
+    if (o.peakNet > minProfit) {
+      const givebackRatio = (o.peakNet - currentNet) / o.peakNet;
+      if (givebackRatio >= 0.60 && currentNet > 0) {
+        // We've given back 60% of peak profit but still positive → PROTECT
+        const why = 'PROTECT';
+        const exitAt = px;
+        const {fee, net, gross} = feeMath(o.entryPx, exitAt, o.amt);
+        o.status = 'closed'; changed = true;
+        const tr = {
+          n:isPaper?++S.papT:++S.liveT, time:new Date().toISOString().slice(11,19),
+          dur:o.openAt?`${o.openAt}→${new Date().toISOString().slice(11,19)}`:'',
+          pair:S.pair, strat:o.strat, isPaper, side:why,
+          entryPx:o.entryPx, exitPx:exitAt, amt:o.amt,
+          fee:+fee.toFixed(6), gross:+gross.toFixed(6), net:+net.toFixed(6)
+        };
+        if(isPaper){S.papProfit+=net;S.papFees+=fee;if(net>=0){S.papW++;if(net>S.papBest)S.papBest=net;}else S.papL++;S.papTrades.unshift(tr);if(S.papTrades.length>200)S.papTrades.length=200;log(`🛡 PAPER PROTECT @ $${px.toFixed(4)} | peak=$${o.peakNet.toFixed(4)} saved=$${net.toFixed(4)}`,'profit');}
+        else{S.liveProfit+=net;S.todayP+=net;S.feesT+=fee;if(net>=0){S.liveW++;if(net>S.bestT)S.bestT=net;}else S.liveL++;S.liveTrades.unshift(tr);if(S.liveTrades.length>200)S.liveTrades.length=200;log(`🛡 LIVE PROTECT @ $${px.toFixed(4)} | was peaking at +$${o.peakNet.toFixed(4)} → saved +$${net.toFixed(4)}`,'profit');placeOrder('SELL',o.qty,S.pair);}
+        save(); return;
+      }
+    }
+
+    // Standard exits: TP or SL
     let why = null;
     let exitAt = px;
 
     if (px >= o.tp) {
       why    = 'TP';
-      exitAt = o.tp;   // exact TP price
+      exitAt = o.tp;
     } else if (px <= o.sl) {
       why    = 'SL';
-      exitAt = o.sl;   // exact SL price
+      exitAt = o.sl;
     }
 
     if (!why) return;
@@ -962,6 +992,24 @@ function futExitCheck(px, isPaper) {
       }
     }
 
+    // ── Profit protection: if in profit and giving back 60%+ of gains → close ──
+    const curNet = futFeeMath(o.entryPx, px, o.margin, o.leverage).net;
+    if (curNet > (o.peakNet||0)) o.peakNet = curNet;
+    const futMinProfit = o.margin * 0.001; // minimum threshold to protect
+    if ((o.peakNet||0) > futMinProfit && curNet > 0) {
+      const giveback = (o.peakNet - curNet) / o.peakNet;
+      if (giveback >= 0.60) {
+        // Gave back 60% of peak profit but still positive → protect it
+        const {net, fee, pnl} = futFeeMath(o.entryPx, px, o.margin, o.leverage);
+        o.status = 'closed'; changed = true;
+        const movePct = ((px-o.entryPx)/o.entryPx*100).toFixed(3);
+        const tr = {n:isPaper?++S.futPapT:++S.futT,time:new Date().toISOString().slice(11,19),pair:S.futPair,direction:'LONG',isPaper,side:'PROTECT',entryPx:o.entryPx,exitPx:px,margin:o.margin,leverage:o.leverage,notional:o.notional,move:movePct+'%',leveragedMove:(parseFloat(movePct)*o.leverage).toFixed(3)+'%',fee:+fee.toFixed(6),pnl:+pnl.toFixed(6),net:+net.toFixed(6)};
+        if(isPaper){S.futPapProfit+=net;S.futFees+=fee;if(net>=0)S.futPapW++;else S.futPapL++;S.futPapTrades.unshift(tr);if(S.futPapTrades.length>200)S.futPapTrades.length=200;log(`🛡 FUT-PAPER PROTECT @ $${px.toFixed(2)} | peak=+$${o.peakNet.toFixed(4)} saved=+$${net.toFixed(4)}`,'profit');}
+        else{S.futProfit+=net;S.futFees+=fee;if(net>=0){S.futW++;if(net>S.futBest)S.futBest=net;}else S.futL++;S.futTrades.unshift(tr);if(S.futTrades.length>200)S.futTrades.length=200;log(`🛡 FUT-LIVE PROTECT @ $${px.toFixed(2)} | peaked +$${o.peakNet.toFixed(4)} → locked +$${net.toFixed(4)}`,'profit');futPlaceOrder('close_long',o.margin,o.leverage,px);}
+        save(); return;
+      }
+    }
+
     // ── Check exit conditions ────────────────────────────────────────────────
     let why = null, exitAt = px;
 
@@ -1232,7 +1280,7 @@ const server = http.createServer((req, res) => {
   // ── GET /status ──────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url === '/status') {
     const I = getIndicators();
-    const addPnl = o => ({...o, livePnl:feeMath(o.entryPx,S.lastPx,o.amt).net});
+    const addPnl = o => ({...o, livePnl:feeMath(o.entryPx,S.lastPx,o.amt).net, peakNet:o.peakNet||0});
     send(res, 200, {
       botOn:S.botOn, mode:S.mode, strategy:S.strategy, pair:S.pair,
       capital:S.capital, maxPos:S.maxPos, tpPct:S.tpPct, slPct:S.slPct,
@@ -1260,8 +1308,8 @@ const server = http.createServer((req, res) => {
       futWR: S.futT>0?Math.round(S.futW/S.futT*100):0,
       futPapProfit:S.futPapProfit, futPapT:S.futPapT, futPapW:S.futPapW, futPapL:S.futPapL,
       futPapWR: S.futPapT>0?Math.round(S.futPapW/S.futPapT*100):0,
-      futOrders:  S.futOrders.filter(o=>o.status==='open').map(o=>({...o, livePnl:futFeeMath(o.entryPx,S.futLastPx||S.lastPx,o.margin,o.leverage).net})),
-      futPapOrders: S.futPapOrders.filter(o=>o.status==='open').map(o=>({...o, livePnl:futFeeMath(o.entryPx,S.futLastPx||S.lastPx,o.margin,o.leverage).net})),
+      futOrders:  S.futOrders.filter(o=>o.status==='open').map(o=>({...o, livePnl:futFeeMath(o.entryPx,S.futLastPx||S.lastPx,o.margin,o.leverage).net, peakNet:o.peakNet||0, beStopMoved:o.beStopMoved||false, bePx:o.bePx||0})),
+      futPapOrders: S.futPapOrders.filter(o=>o.status==='open').map(o=>({...o, livePnl:futFeeMath(o.entryPx,S.futLastPx||S.lastPx,o.margin,o.leverage).net, peakNet:o.peakNet||0, beStopMoved:o.beStopMoved||false, bePx:o.bePx||0})),
       futTrades:    S.futTrades.slice(0,50),
       futPapTrades: S.futPapTrades.slice(0,50),
       futTicks:     S.futTicks||0,
@@ -1457,6 +1505,47 @@ const server = http.createServer((req, res) => {
       S.papProfit=0;S.papT=0;S.papW=0;S.papL=0;S.papBest=0;S.papFees=0;
       S.papTrades=[];S.papOrders=[];
       save(); send(res, 200, {ok:true}); return;
+    }
+
+    // /closetrade — manually close a spot position by id
+    if (url === '/closetrade') {
+      const {id, isPaper} = d;
+      const orders = isPaper ? S.papOrders : S.liveOrders;
+      const o = orders.find(o => o.id == id && o.status === 'open');
+      if (!o) { send(res, 404, {error:'Position not found'}); return; }
+      const px = S.lastPx;
+      const {fee, net, gross} = feeMath(o.entryPx, px, o.amt);
+      o.status = 'closed';
+      const tr = {
+        n:isPaper?++S.papT:++S.liveT, time:new Date().toISOString().slice(11,19),
+        dur:o.openAt?`${o.openAt}→${new Date().toISOString().slice(11,19)}`:'',
+        pair:S.pair, strat:o.strat, isPaper, side:'MANUAL',
+        entryPx:o.entryPx, exitPx:px, amt:o.amt,
+        fee:+fee.toFixed(6), gross:+gross.toFixed(6), net:+net.toFixed(6)
+      };
+      if(isPaper){S.papProfit+=net;S.papFees+=fee;if(net>=0){S.papW++;if(net>S.papBest)S.papBest=net;}else S.papL++;S.papTrades.unshift(tr);S.papOrders=S.papOrders.filter(o=>o.status==='open');}
+      else{S.liveProfit+=net;S.todayP+=net;S.feesT+=fee;if(net>=0){S.liveW++;if(net>S.bestT)S.bestT=net;}else S.liveL++;S.liveTrades.unshift(tr);S.liveOrders=S.liveOrders.filter(o=>o.status==='open');placeOrder('SELL',o.qty,S.pair);}
+      log(`🖱 MANUAL CLOSE spot @ $${px.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`,'info');
+      save();
+      send(res, 200, {ok:true, net, fee, exitPx:px}); return;
+    }
+
+    // /closefuttrade — manually close a futures position by id
+    if (url === '/closefuttrade') {
+      const {id, isPaper} = d;
+      const orders = isPaper ? S.futPapOrders : S.futOrders;
+      const o = orders.find(o => o.id == id && o.status === 'open');
+      if (!o) { send(res, 404, {error:'Futures position not found'}); return; }
+      const px = S.futLastPx || S.lastPx;
+      const {net, fee, pnl} = futFeeMath(o.entryPx, px, o.margin, o.leverage);
+      o.status = 'closed';
+      const movePct = ((px-o.entryPx)/o.entryPx*100).toFixed(3);
+      const tr = {n:isPaper?++S.futPapT:++S.futT,time:new Date().toISOString().slice(11,19),pair:S.futPair,direction:'LONG',isPaper,side:'MANUAL',entryPx:o.entryPx,exitPx:px,margin:o.margin,leverage:o.leverage,notional:o.notional,move:movePct+'%',leveragedMove:(parseFloat(movePct)*o.leverage).toFixed(3)+'%',fee:+fee.toFixed(6),pnl:+pnl.toFixed(6),net:+net.toFixed(6)};
+      if(isPaper){S.futPapProfit+=net;S.futFees+=fee;if(net>=0)S.futPapW++;else S.futPapL++;S.futPapTrades.unshift(tr);S.futPapOrders=S.futPapOrders.filter(o=>o.status==='open');}
+      else{S.futProfit+=net;S.futFees+=fee;if(net>=0){S.futW++;if(net>S.futBest)S.futBest=net;}else S.futL++;S.futTrades.unshift(tr);S.futOrders=S.futOrders.filter(o=>o.status==='open');futPlaceOrder('close_long',o.margin,o.leverage,px);}
+      log(`🖱 MANUAL CLOSE futures @ $${px.toFixed(2)} NET=${net>=0?'+':''}$${net.toFixed(4)}`,'info');
+      save();
+      send(res, 200, {ok:true, net, fee, exitPx:px}); return;
     }
 
     // /startfutures
