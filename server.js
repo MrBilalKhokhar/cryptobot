@@ -79,7 +79,7 @@ let S = {
   trailPct: 0.20,        // 0.20% trail — only activates after 60% toward TP
   maxDaily: 200,
   cooldown: 10000,       // 10 seconds between entries
-  warmup:   20,          // 20 ticks = ~30 seconds to warm up
+  warmup:   5,           // 5 ticks = ~8 seconds to warm up
 
   // Live stats
   liveProfit:0, todayP:0, liveT:0, liveW:0, liveL:0, bestT:0, feesT:0,
@@ -109,7 +109,7 @@ let S = {
   futCapital:   20,             // USDT margin per session
   futMaxPos:    1,              // max concurrent futures positions
   futLeverage:  3,              // 3x leverage (safe default)
-  futTpPct:     0.45,           // 0.45% TP → net +0.41% after 0.04% fee (R:R > 2:1 vs SL)
+  futTpPct:     0.45,           // 0.45% TP -> net +0.41% after 0.04% fee (R:R > 2:1 vs SL)
   futSlPct:     0.20,           // 0.20% SL (tight — BE-stop moves it to entry after 40% toward TP)
   futStrategy:  'auto',         // same signal engine
   futMaxDaily:  300,
@@ -447,21 +447,25 @@ async function onTick(px) {
     if (I) log(`[T${ticks}] $${px.toFixed(4)} RSI=${I.rsi14.toFixed(1)} dip=${I.dipFromHi.toFixed(3)}% ch1=${I.ch1.toFixed(4)}% sig=${sig.signal}`, 'info');
   }
 
-  if (!sig.signal) {
-    // Still call AI in background even when no signal (so decision is fresh)
-    if (S.aiKey && S.aiMode !== 'off') callDeepSeek(px, false);
+  if (!sig.signal && S.aiMode !== 'ai-only') {
+    if (S.aiKey) callDeepSeek(px, false);
     return;
+  }
+  if (!sig.signal && S.aiMode === 'ai-only') {
+    // AI-only mode: skip indicator requirement, let AI decide below
   }
 
-  // Call AI and check its decision
-  if (S.aiKey && S.aiMode !== 'off') {
-    await callDeepSeek(px, false);
-  }
-  if (!aiSignalOk(false)) {
-    const d = S.aiDecision;
-    if (d) log(`🤖 AI BLOCKED entry: ${d.action} conf=${d.confidence}% (min=${S.aiMinConf}%) — ${d.reason}`, 'info');
+  // Call AI and get decision
+  if (S.aiKey && S.aiMode !== 'off') await callDeepSeek(px, false);
+  const aiCheck = aiSignalOk(false);
+  if (!aiCheck.ok) {
+    if (aiCheck.reason) log(`🤖 SPOT BLOCKED: ${aiCheck.reason}`, 'info');
     return;
   }
+  // Use AI-suggested TP/SL if provided and better than config
+  const aiDec = aiCheck.decision;
+  if (aiDec?.tp_suggest && aiDec.tp_suggest > 0.22) S._aiTpOverride = aiDec.tp_suggest;
+  if (aiDec?.sl_suggest && aiDec.sl_suggest > 0.10) S._aiSlOverride = aiDec.sl_suggest;
 
   // ENTER
   const papOpen = S.papOrders.filter(o=>o.status==='open').length;
@@ -494,14 +498,14 @@ async function onTick(px) {
 // ── ENTER TRADE ───────────────────────────────────────────────────────────────
 function enter(px, reason, isPaper) {
   const amt  = S.capital / S.maxPos;
-  // TP must be max of: configured %, and break-even+MIN_NET
-  // Add extra 0.02% buffer above min to account for price rounding
-  // Guaranteed profit: TP must be well above break-even including fees
-  // Formula: TP >= entry * (1 + RT_FEE + MIN_NET + 0.05% buffer)
-  const configTp = px * (1 + S.tpPct/100);
-  const safeTpPx = minTP(px, amt) * 1.0005;  // 0.05% buffer above break-even
+  // Use AI-suggested TP/SL if available
+  const useTp = S._aiTpOverride || S.tpPct;
+  const useSl = S._aiSlOverride || S.slPct;
+  S._aiTpOverride = null; S._aiSlOverride = null; // consume
+
+  const configTp = px * (1 + useTp/100);
+  const safeTpPx = minTP(px, amt) * 1.0005;
   const tp = parseFloat(Math.max(configTp, safeTpPx).toFixed(8));
-  // Log the guaranteed profit amount for transparency
   const guaranteedNet = (tp - px) / px * 100 - RT_FEE * 100;
   const sl   = parseFloat((px*(1-S.slPct/100)).toFixed(8));
   const trail = 0; // trail disabled — TP/SL only
@@ -541,25 +545,25 @@ function exitCheck(px, isPaper) {
 
     // ── PROFIT PROTECTION ──────────────────────────────────────────────────
     // If position was in profit (peakNet > minProfit) and price dropped
-    // giving back more than 60% of peak profit → close now to protect gains
+    // giving back more than 60% of peak profit -> close now to protect gains
     const minProfit = o.amt * 0.0008; // minimum $0.0008 per $1 to be worth protecting
     if (o.peakNet > minProfit) {
       const givebackRatio = (o.peakNet - currentNet) / o.peakNet;
       if (givebackRatio >= 0.60 && currentNet > 0) {
-        // We've given back 60% of peak profit but still positive → PROTECT
+        // We've given back 60% of peak profit but still positive -> PROTECT
         const why = 'PROTECT';
         const exitAt = px;
         const {fee, net, gross} = feeMath(o.entryPx, exitAt, o.amt);
         o.status = 'closed'; changed = true;
         const tr = {
           n:isPaper?++S.papT:++S.liveT, time:new Date().toISOString().slice(11,19),
-          dur:o.openAt?`${o.openAt}→${new Date().toISOString().slice(11,19)}`:'',
+          dur:o.openAt?`${o.openAt}->${new Date().toISOString().slice(11,19)}`:'',
           pair:S.pair, strat:o.strat, isPaper, side:why,
           entryPx:o.entryPx, exitPx:exitAt, amt:o.amt,
           fee:+fee.toFixed(6), gross:+gross.toFixed(6), net:+net.toFixed(6)
         };
         if(isPaper){S.papProfit+=net;S.papFees+=fee;if(net>=0){S.papW++;if(net>S.papBest)S.papBest=net;}else S.papL++;S.papTrades.unshift(tr);if(S.papTrades.length>200)S.papTrades.length=200;log(`🛡 PAPER PROTECT @ $${px.toFixed(4)} | peak=$${o.peakNet.toFixed(4)} saved=$${net.toFixed(4)}`,'profit');}
-        else{S.liveProfit+=net;S.todayP+=net;S.feesT+=fee;if(net>=0){S.liveW++;if(net>S.bestT)S.bestT=net;}else S.liveL++;S.liveTrades.unshift(tr);if(S.liveTrades.length>200)S.liveTrades.length=200;log(`🛡 LIVE PROTECT @ $${px.toFixed(4)} | was peaking at +$${o.peakNet.toFixed(4)} → saved +$${net.toFixed(4)}`,'profit');placeOrder('SELL',o.qty,S.pair);}
+        else{S.liveProfit+=net;S.todayP+=net;S.feesT+=fee;if(net>=0){S.liveW++;if(net>S.bestT)S.bestT=net;}else S.liveL++;S.liveTrades.unshift(tr);if(S.liveTrades.length>200)S.liveTrades.length=200;log(`🛡 LIVE PROTECT @ $${px.toFixed(4)} | was peaking at +$${o.peakNet.toFixed(4)} -> saved +$${net.toFixed(4)}`,'profit');placeOrder('SELL',o.qty,S.pair);}
         save(); return;
       }
     }
@@ -592,7 +596,7 @@ function exitCheck(px, isPaper) {
     const tr = {
       n: isPaper ? ++S.papT : ++S.liveT,
       time:new Date().toISOString().slice(11,19),
-      dur:o.openAt?`${o.openAt}→${new Date().toISOString().slice(11,19)}`:'',
+      dur:o.openAt?`${o.openAt}->${new Date().toISOString().slice(11,19)}`:'',
       pair:S.pair, strat:o.strat, isPaper,
       side:why, entryPx:o.entryPx, exitPx:exitAt,
       amt:o.amt, fee:+fee.toFixed(6),
@@ -752,7 +756,7 @@ function testMexcConnection() {
       log(`❌ Key test: code=${r.code} msg=${r.msg}`, 'err');
       if (r.code==700002||r.code=='700002') log('❌ Signature invalid — copy keys again from MEXC exactly, no spaces','err');
       if (r.code==700003||r.code=='700003') log('❌ Invalid API key — re-copy MEXC_KEY from MEXC API Management','err');
-      if (r.code===700006) log('❌ FIX: IP whitelist on — MEXC API key → Edit → remove all IP restrictions','err');
+      if (r.code===700006) log('❌ FIX: IP whitelist on — MEXC API key -> Edit -> remove all IP restrictions','err');
       if (r.code===10072)  log('❌ FIX: API key not found or deleted on MEXC','err');
     }
   });
@@ -815,7 +819,7 @@ async function onFuturesTick(px) {
   futExitCheck(px, true);   // paper
   futExitCheck(px, false);  // live
 
-  if (futTicks < 20) return;  // warmup
+  if (futTicks < 5) return;   // warmup (5 ticks = ~8s)
 
   const now = Date.now();
   if (now - S.futLastEntry < S.futCooldown) return;
@@ -828,20 +832,34 @@ async function onFuturesTick(px) {
     log(`[FUT T${futTicks}] $${px.toFixed(2)} sig=${sig.signal} ${sig.reason}`, 'info');
   }
 
-  if (!sig.signal) {
-    if (S.aiKey && S.aiMode !== 'off') callDeepSeek(px, true);
+  // In AI-only mode: skip indicator signals, AI decides everything
+  if (!sig.signal && S.aiMode !== 'ai-only') {
+    if (S.aiKey) callDeepSeek(px, true); // keep AI fresh
+    return;
+  }
+  if (!sig.signal && S.aiMode === 'ai-only') {
+    // AI-only: continue to AI check even without indicator signal
+  }
+
+  // AI check for futures — also runs even without indicator signal in ai-only mode
+  if (S.aiKey && S.aiMode !== 'off') await callDeepSeek(px, true);
+  const aiCheck = aiSignalOk(true);
+
+  // In AI-only mode: AI can trigger entry even without indicator signal
+  if (S.aiMode === 'ai-only' && !aiCheck.ok) {
+    if (aiCheck.reason) log(`🤖 FUT BLOCKED: ${aiCheck.reason}`, 'info');
+    return;
+  }
+  if (S.aiMode !== 'ai-only' && !aiCheck.ok) {
+    if (aiCheck.reason) log(`🤖 FUT BLOCKED: ${aiCheck.reason}`, 'info');
     return;
   }
 
-  // AI check for futures
-  if (S.aiKey && S.aiMode !== 'off') {
-    await callDeepSeek(px, true);
-  }
-  if (!aiSignalOk(true)) {
-    const d = S.aiFutDecision;
-    if (d) log(`🤖 AI BLOCKED futures entry: ${d.action} conf=${d.confidence}% — ${d.reason}`, 'info');
-    return;
-  }
+  // Use AI-suggested TP/SL if available
+  const futAiDec = aiCheck.decision;
+  const futAiAction = aiCheck.action; // 'BUY' (long) or 'SHORT'
+  if (futAiDec?.tp_suggest) S._futAiTpOverride = futAiDec.tp_suggest;
+  if (futAiDec?.sl_suggest) S._futAiSlOverride = futAiDec.sl_suggest;
 
   // Enter paper futures always
   const papOpen = S.futPapOrders.filter(o=>o.status==='open').length;
@@ -864,7 +882,7 @@ async function onFuturesTick(px) {
 // ── FUTURES SIGNAL ───────────────────────────────────────────────────────────
 // Strict entry: needs 3/5 conditions — fewer bad trades = higher win rate
 function getFuturesSignal(px) {
-  if (futPX.length < 15) return {signal:false, reason:'warmup'};
+  if (futPX.length < 5) return {signal:false, reason:'warmup'};
   const raw = futPX;
   const r14  = calcRSI(raw, 14);
   const r9   = calcRSI(raw, 9);
@@ -919,7 +937,7 @@ function futFeeMath(entryPx, exitPx, marginUsdt, leverage) {
 function futBreakEven(entryPx, marginUsdt, leverage) {
   const notional  = marginUsdt * leverage;
   const contracts = notional / entryPx;
-  // pnl = fee → (exitPx - entryPx) * contracts = fee
+  // pnl = fee -> (exitPx - entryPx) * contracts = fee
   // exitPx = entryPx + fee/contracts
   const fee = notional * FUT_RT_FEE;
   return entryPx + (fee / contracts);
@@ -937,17 +955,18 @@ function futEnter(px, reason, isPaper) {
   const lev      = S.futLeverage;
   const notional = margin * lev;
 
-  // CRITICAL: TP must be at least 2× SL distance to ensure R:R > 1
-  // Minimum TP = fee break-even + profit buffer
+  // Use AI-suggested TP/SL if available, else use config
+  const aiTp = S._futAiTpOverride || S.futTpPct;
+  const aiSl = S._futAiSlOverride || S.futSlPct;
+  S._futAiTpOverride = null; S._futAiSlOverride = null; // consume override
+
   const minTpPx  = futMinTP(px, margin, lev);
-  const wantTp   = px * (1 + S.futTpPct / 100);
+  const wantTp   = px * (1 + aiTp / 100);
   const tp       = parseFloat(Math.max(wantTp, minTpPx).toFixed(4));
 
-  // SL must be LESS than TP distance so R:R ≥ 1.5
-  // Max SL = 50% of TP distance (guarantees 2:1 R:R)
   const tpDist   = tp - px;
-  const wantSl   = px * (1 - S.futSlPct / 100);
-  const maxSlDist = tpDist * 0.55;  // SL at most 55% of TP distance
+  const wantSl   = px * (1 - aiSl / 100);
+  const maxSlDist = tpDist * 0.55;
   const sl       = parseFloat(Math.max(wantSl, px - maxSlDist).toFixed(4));
 
   // Break-even stop: once price reaches 50% of TP, move SL to break-even+fee
@@ -985,10 +1004,10 @@ function futEnter(px, reason, isPaper) {
 
 // ── FUTURES EXIT CHECK ────────────────────────────────────────────────────────
 // Smart exits:
-// 1. TP hit → close in profit (guaranteed after fees)
-// 2. SL hit → small controlled loss
-// 3. Break-even stop: if price reached 50% toward TP then fell back → close at 0 loss
-// 4. Profit lock: if position shows live profit > 50% of target → move SL to lock it
+// 1. TP hit -> close in profit (guaranteed after fees)
+// 2. SL hit -> small controlled loss
+// 3. Break-even stop: if price reached 50% toward TP then fell back -> close at 0 loss
+// 4. Profit lock: if position shows live profit > 50% of target -> move SL to lock it
 function futExitCheck(px, isPaper) {
   const orders = isPaper ? S.futPapOrders : S.futOrders;
   let changed  = false;
@@ -1031,20 +1050,20 @@ function futExitCheck(px, isPaper) {
       }
     }
 
-    // ── Profit protection: if in profit and giving back 60%+ of gains → close ──
+    // ── Profit protection: if in profit and giving back 60%+ of gains -> close ──
     const curNet = futFeeMath(o.entryPx, px, o.margin, o.leverage).net;
     if (curNet > (o.peakNet||0)) o.peakNet = curNet;
     const futMinProfit = o.margin * 0.001; // minimum threshold to protect
     if ((o.peakNet||0) > futMinProfit && curNet > 0) {
       const giveback = (o.peakNet - curNet) / o.peakNet;
       if (giveback >= 0.60) {
-        // Gave back 60% of peak profit but still positive → protect it
+        // Gave back 60% of peak profit but still positive -> protect it
         const {net, fee, pnl} = futFeeMath(o.entryPx, px, o.margin, o.leverage);
         o.status = 'closed'; changed = true;
         const movePct = ((px-o.entryPx)/o.entryPx*100).toFixed(3);
         const tr = {n:isPaper?++S.futPapT:++S.futT,time:new Date().toISOString().slice(11,19),pair:S.futPair,direction:'LONG',isPaper,side:'PROTECT',entryPx:o.entryPx,exitPx:px,margin:o.margin,leverage:o.leverage,notional:o.notional,move:movePct+'%',leveragedMove:(parseFloat(movePct)*o.leverage).toFixed(3)+'%',fee:+fee.toFixed(6),pnl:+pnl.toFixed(6),net:+net.toFixed(6)};
         if(isPaper){S.futPapProfit+=net;S.futFees+=fee;if(net>=0)S.futPapW++;else S.futPapL++;S.futPapTrades.unshift(tr);if(S.futPapTrades.length>200)S.futPapTrades.length=200;log(`🛡 FUT-PAPER PROTECT @ $${px.toFixed(2)} | peak=+$${o.peakNet.toFixed(4)} saved=+$${net.toFixed(4)}`,'profit');}
-        else{S.futProfit+=net;S.futFees+=fee;if(net>=0){S.futW++;if(net>S.futBest)S.futBest=net;}else S.futL++;S.futTrades.unshift(tr);if(S.futTrades.length>200)S.futTrades.length=200;log(`🛡 FUT-LIVE PROTECT @ $${px.toFixed(2)} | peaked +$${o.peakNet.toFixed(4)} → locked +$${net.toFixed(4)}`,'profit');futPlaceOrder('close_long',o.margin,o.leverage,px);}
+        else{S.futProfit+=net;S.futFees+=fee;if(net>=0){S.futW++;if(net>S.futBest)S.futBest=net;}else S.futL++;S.futTrades.unshift(tr);if(S.futTrades.length>200)S.futTrades.length=200;log(`🛡 FUT-LIVE PROTECT @ $${px.toFixed(2)} | peaked +$${o.peakNet.toFixed(4)} -> locked +$${net.toFixed(4)}`,'profit');futPlaceOrder('close_long',o.margin,o.leverage,px);}
         save(); return;
       }
     }
@@ -1255,182 +1274,86 @@ function calcBB(arr,n=20){
 // ══════════════════════════════════════════════════════════════════════════════
 
 function buildMarketContext(px, isFutures) {
-  const raw   = isFutures ? futPX : PX.map(p=>p.px||p);
-  const n     = raw.length;
-  if (n < 5) return null;
+  const raw = (isFutures ? futPX : PX.map(p=>p.px||p)).filter(v=>v>0);
+  const n   = raw.length;
+  if (n < 3) return null;
 
-  const r14   = calcRSI(raw, 14);
-  const r9    = calcRSI(raw, 9);
-  const e9    = calcEMA(raw, Math.min(9,n));
-  const e21   = calcEMA(raw, Math.min(21,n));
-  const bb    = calcBB(raw, Math.min(20,n));
-  const hi10  = Math.max(...raw.slice(-10));
-  const lo10  = Math.min(...raw.slice(-10));
-  const dip   = ((px-hi10)/hi10*100).toFixed(3);
-  const ch1   = n>1 ? ((px-raw[n-2])/raw[n-2]*100).toFixed(4) : '0';
-  const ch5   = n>5 ? ((px-raw[n-6])/raw[n-6]*100).toFixed(4) : '0';
-  const trend = e9>e21 ? 'UP' : e9<e21 ? 'DOWN' : 'FLAT';
-  const bbPos = bb ? (px<bb.lower?'BELOW_LOWER':px>bb.upper?'ABOVE_UPPER':px<bb.middle?'LOWER_HALF':'UPPER_HALF') : 'UNKNOWN';
+  const r14  = calcRSI(raw, Math.min(14,n-1));
+  const r9   = calcRSI(raw, Math.min(9,n-1));
+  const e9   = calcEMA(raw, Math.min(9,n));
+  const e21  = calcEMA(raw, Math.min(21,n));
+  const bb   = n>=10 ? calcBB(raw, Math.min(20,n)) : null;
+  const slc  = raw.slice(-Math.min(10,n));
+  const hi   = Math.max(...slc);
+  const lo   = Math.min(...slc);
+  const dip  = ((px-hi)/hi*100).toFixed(3);
+  const ch1  = n>1 ? ((px-raw[n-2])/raw[n-2]*100).toFixed(4) : '0';
+  const ch5  = n>5 ? ((px-raw[n-6])/raw[n-6]*100).toFixed(4) : '0';
+  const trend= e9>e21 ? 'UPTREND' : e9<e21 ? 'DOWNTREND' : 'SIDEWAYS';
+  const bbPos= bb ? (px<=bb.lower?'AT_SUPPORT':px>=bb.upper?'AT_RESISTANCE':px<bb.middle?'MID_LOW':'MID_HIGH') : 'UNKNOWN';
+  const vol  = slc.length>1 ? (Math.max(...slc)-Math.min(...slc))/lo*100 : 0;
 
-  // Last 5 trade results
-  const trades = isFutures ? S.futTrades : S.liveTrades;
-  const lastResults = trades.slice(0,5).map(t=>t.side+(t.net>=0?'✓':'✗')).join(' ');
-  // Recent 10 prices (compact)
-  const recentPx = raw.slice(-10).map(p=>parseFloat(p).toFixed(0)).join(',');
+  const allTrades = isFutures ? S.futTrades : S.liveTrades;
+  const papTrades = isFutures ? S.futPapTrades : S.papTrades;
+  const recentL   = allTrades.slice(0,5).map(t=>`${t.side}${t.net>=0?'+'+t.net.toFixed(3):t.net.toFixed(3)}`).join(' ');
+  const recentP   = papTrades.slice(0,5).map(t=>`${t.side}${t.net>=0?'+'+t.net.toFixed(3):t.net.toFixed(3)}`).join(' ');
+  const totalP    = isFutures ? S.futProfit : S.liveProfit;
+  const winRate   = isFutures ? (S.futT>0?Math.round(S.futW/S.futT*100):0) : (S.liveT>0?Math.round(S.liveW/S.liveT*100):0);
+  const openPos   = (isFutures ? S.futOrders : S.liveOrders).filter(o=>o.status==='open').length;
 
   return {
     pair: isFutures ? S.futPair : S.pair,
+    type: isFutures ? `FUTURES ${S.futLeverage}x leverage` : 'SPOT',
     price: px,
     rsi14: r14.toFixed(1), rsi9: r9.toFixed(1),
-    ema: trend,
-    bb: bbPos,
-    dip1min: dip,
-    tick1s: ch1, tick5s: ch5,
-    bbLower: bb?.lower.toFixed(2)||'?',
-    bbUpper: bb?.upper.toFixed(2)||'?',
-    recent10px: recentPx,
-    lastTrades: lastResults||'none yet',
-    lev: isFutures ? S.futLeverage+'x' : '1x (spot)',
-    fee: isFutures ? '0.04% RT' : '0.10% RT',
-    tpTarget: isFutures ? S.futTpPct+'%' : S.tpPct+'%',
-    slTarget: isFutures ? S.futSlPct+'%' : S.slPct+'%'
+    ema9: e9.toFixed(2), ema21: e21.toFixed(2),
+    trend, bbPos,
+    bbLower: bb?.lower.toFixed(2)||'n/a',
+    bbMid:   bb?.middle.toFixed(2)||'n/a',
+    bbUpper: bb?.upper.toFixed(2)||'n/a',
+    dip10tick: dip,
+    ch1tick: ch1, ch5tick: ch5,
+    volatility: vol.toFixed(4)+'%',
+    recentPrices: raw.slice(-8).map(p=>p.toFixed(0)).join('->'),
+    liveTrades: recentL||'none',
+    paperTrades: recentP||'none',
+    totalProfit: '$'+totalP.toFixed(4),
+    winRate: winRate+'%',
+    openPositions: openPos,
+    maxPositions: isFutures ? S.futMaxPos : S.maxPos,
+    capital: isFutures ? S.futCapital : S.capital,
+    fee: isFutures ? '0.04%' : '0.10%',
+    tpConfig: isFutures ? S.futTpPct+'%' : S.tpPct+'%',
+    slConfig: isFutures ? S.futSlPct+'%' : S.slPct+'%'
   };
 }
 
 function buildPrompt(ctx) {
-  return `You are an expert crypto scalp trader. Analyze this ${ctx.pair} market snapshot and decide whether to open a LONG position RIGHT NOW.
-
-MARKET DATA:
-- Price: $${ctx.price} | Pair: ${ctx.pair}
-- RSI-14: ${ctx.rsi14} | RSI-9: ${ctx.rsi9}
-- EMA trend: ${ctx.ema} (EMA9 vs EMA21)
-- Bollinger Band position: ${ctx.bb} (lower=$${ctx.bbLower}, upper=$${ctx.bbUpper})
-- Dip from 10-tick high: ${ctx.dip1min}%
-- Price change last 1.5s: ${ctx.tick1s}% | last 7.5s: ${ctx.tick5s}%
-- Recent 10 prices: ${ctx.recent10px}
-- Last 5 trade results: ${ctx.lastTrades}
-- Trade params: TP=${ctx.tpTarget} SL=${ctx.slTarget} Fee=${ctx.fee} Leverage=${ctx.lev}
-
-RULES:
-- BUY only when there is a high-probability reversal or continuation up
-- AVOID if RSI>70 (overbought), price is falling fast, or trend is strongly down
-- HOLD if uncertain — missing a trade is better than a bad trade
-- Consider fees: need ${ctx.tpTarget} price move to profit
-
-Respond ONLY with this exact JSON (no other text):
-{"action":"BUY","confidence":75,"reason":"brief 1-sentence reason","risk":"low|med|high"}
-or
-{"action":"HOLD","confidence":80,"reason":"brief reason","risk":"low|med|high"}`;
-}
-
-async function callDeepSeek(px, isFutures) {
-  if (!S.aiKey) return;
-  const ctx = buildMarketContext(px, isFutures);
-  if (!ctx) return;
-
-  const now = Date.now();
-  const lastCall = isFutures ? S.aiFutLastCall : S.aiLastCall;
-  if (now - lastCall < S.aiInterval * 1000) return; // respect interval
-
-  if (isFutures) S.aiFutLastCall = now; else S.aiLastCall = now;
-  S.aiCallCount++;
-
-  const prompt = buildPrompt(ctx);
-
-  return new Promise(resolve => {
-    const body = JSON.stringify({
-      model: 'deepseek-chat',
-      messages: [
-        {role:'system', content:'You are an expert crypto scalp trader. Always respond with valid JSON only.'},
-        {role:'user',   content: prompt}
-      ],
-      max_tokens: 120,
-      temperature: 0.1,   // low temp = consistent, logical decisions
-      stream: false
-    });
-
-    const req = https.request({
-      hostname: 'api.deepseek.com',
-      path:     '/v1/chat/completions',
-      method:   'POST',
-      headers: {
-        'Authorization': `Bearer ${S.aiKey}`,
-        'Content-Type':  'application/json',
-        'Content-Length': Buffer.byteLength(body)
-      },
-      timeout: 10000
-    }, res => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => {
-        try {
-          const resp = JSON.parse(d);
-          if (resp.error) {
-            log(`AI error: ${resp.error.message}`, 'err');
-            resolve(null); return;
-          }
-          const raw = resp.choices?.[0]?.message?.content || '';
-          // Track token usage and cost
-          const tokens = resp.usage?.total_tokens || 0;
-          S.aiTokensUsed += tokens;
-          S.aiCost = parseFloat((S.aiTokensUsed / 1000000 * 0.28).toFixed(6)); // $0.28/1M tokens
-
-          // Parse AI response JSON
-          const jsonMatch = raw.match(/\{[\s\S]*\}/);
-          if (!jsonMatch) { resolve(null); return; }
-          const decision = JSON.parse(jsonMatch[0]);
-          decision.ts = new Date().toISOString().slice(11,19);
-          decision.price = px;
-          decision.tokens = tokens;
-
-          if (isFutures) S.aiFutDecision = decision;
-          else           S.aiDecision    = decision;
-
-          // Log AI decision with appropriate emoji
-          const emoji = decision.action==='BUY'?'🤖 AI BUY':'🤖 AI HOLD';
-          const conf  = decision.confidence||0;
-          log(`${emoji} conf=${conf}% | ${decision.reason} | risk=${decision.risk} | tokens=${tokens}`,
-              decision.action==='BUY'&&conf>=(S.aiMinConf||65) ? 'buy' : 'info');
-
-          resolve(decision);
-        } catch(e) {
-          log(`AI parse error: ${e.message}`, 'err');
-          resolve(null);
-        }
-      });
-    });
-    req.on('error', e => { log(`AI network error: ${e.message}`, 'err'); resolve(null); });
-    req.on('timeout', () => { req.destroy(); log('AI timeout', 'err'); resolve(null); });
-    req.write(body);
-    req.end();
-  });
-}
-
-function aiSignalOk(isFutures) {
-  if (S.aiMode === 'off') return true; // AI disabled → pass through
-
-  const decision = isFutures ? S.aiFutDecision : S.aiDecision;
-  const minConf  = S.aiMinConf || 65;
-
-  if (!decision) {
-    // No AI decision yet — in hybrid mode allow first entry, in ai-only block
-    return S.aiMode !== 'ai-only';
-  }
-
-  // Decision is stale if older than 2 intervals
-  const age = Date.now() - (isFutures ? S.aiFutLastCall : S.aiLastCall);
-  if (age > S.aiInterval * 2000) {
-    return S.aiMode !== 'ai-only'; // stale = fallback to signals
-  }
-
-  if (S.aiMode === 'ai-only') {
-    return decision.action === 'BUY' && decision.confidence >= minConf;
-  }
-
-  // hybrid: AI must say BUY with at least minConf confidence
-  if (decision.action !== 'BUY') return false;
-  if (decision.confidence < minConf) return false;
-  return true;
+function buildPrompt(ctx) {
+  var isFut = ctx.type.indexOf("FUTURES") !== -1;
+  var shortLine = isFut ? "- SHORT: RSI>60, EMA bearish, price at resistance -> open short\n" : "";
+  var p = "";
+  p += "You are an autonomous crypto trading agent managing real money. Goal: grow the account.\n\n";
+  p += "ACCOUNT: capital=$" + ctx.capital + " open=" + ctx.openPositions + "/" + ctx.maxPositions;
+  p += " profit=" + ctx.totalProfit + " winRate=" + ctx.winRate + "\n";
+  p += "LiveTrades: " + ctx.liveTrades + "\n";
+  p += "PaperTrades: " + ctx.paperTrades + "\n\n";
+  p += "MARKET " + ctx.pair + " " + ctx.type + ":\n";
+  p += "Price=$" + ctx.price + " RSI14=" + ctx.rsi14 + " RSI9=" + ctx.rsi9 + "\n";
+  p += "EMA9=$" + ctx.ema9 + " EMA21=$" + ctx.ema21 + " trend=" + ctx.trend + "\n";
+  p += "BB: lower=$" + ctx.bbLower + " mid=$" + ctx.bbMid + " upper=$" + ctx.bbUpper + " pos=" + ctx.bbPos + "\n";
+  p += "dip=" + ctx.dip10tick + "% ch1=" + ctx.ch1tick + "% ch5=" + ctx.ch5tick + "%\n";
+  p += "volatility=" + ctx.volatility + " recentPx=" + ctx.recentPrices + "\n\n";
+  p += "SETTINGS: TP=" + ctx.tpConfig + " SL=" + ctx.slConfig + " fee=" + ctx.fee + "\n\n";
+  p += "YOUR RULES:\n";
+  p += "- BUY: RSI<50, price bouncing from dip, EMA uptrend or neutral -> enter long\n";
+  p += shortLine;
+  p += "- HOLD: uncertain, RSI 50-65, sideways, recent losses -> skip this cycle\n";
+  p += "- Never chase pumps: if RSI>70 or price at top, HOLD\n";
+  p += "- If last 3 trades all SL losses -> be conservative, HOLD unless very strong signal\n\n";
+  p += "Respond ONLY with this JSON (no text outside JSON):\n";
+  p += "{\"action\":\"BUY\",\"confidence\":78,\"reason\":\"one sentence\",\"risk\":\"low|med|high\",\"tp_suggest\":0.45,\"sl_suggest\":0.20}";
+  return p;
 }
 
 // ── CORS + JSON HELPER ────────────────────────────────────────────────────────
@@ -1561,7 +1484,7 @@ const server = http.createServer((req, res) => {
   // ── /balance ─────────────────────────────────────────────────────────────────
   if (url === '/balance') {
     if (!S.apiKey || !S.apiSecret) {
-      send(res, 400, {error:'No API keys in server memory. Go to Config tab → enter MEXC keys → Save API Keys Permanently', hasKeys:false});
+      send(res, 400, {error:'No API keys in server memory. Go to Config tab -> enter MEXC keys -> Save API Keys Permanently', hasKeys:false});
       return;
     }
     mexcRequest('GET', '/api/v3/account', {}, S.apiKey, S.apiSecret, (err, acc) => {
@@ -1592,7 +1515,7 @@ const server = http.createServer((req, res) => {
   // ── GET or POST /testconnection ───────────────────────────────────────────────
   if (url === '/testconnection') {
     if (!S.apiKey || !S.apiSecret) {
-      send(res, 400, {error:'No API keys in server memory. Go to Config → enter MEXC keys → Save API Keys Permanently', hasKeys:false});
+      send(res, 400, {error:'No API keys in server memory. Go to Config -> enter MEXC keys -> Save API Keys Permanently', hasKeys:false});
       return;
     }
     testMexcConnection();
@@ -1644,7 +1567,7 @@ const server = http.createServer((req, res) => {
           log(`❌ Key test FAILED: code=${acc.code} msg=${acc.msg}`, 'err');
           if (acc.code==700002||acc.code=='700002') log('❌ Signature invalid — try saving keys again. Make sure no spaces in key/secret','err');
           if (acc.code==700003||acc.code=='700003') log('❌ Invalid key — re-copy Access Key from MEXC API Management exactly','err');
-          if (acc.code==700006||acc.code=='700006') log('❌ IP whitelist blocking — MEXC API Management → your key → remove IP restriction','err');
+          if (acc.code==700006||acc.code=='700006') log('❌ IP whitelist blocking — MEXC API Management -> your key -> remove IP restriction','err');
         }
       });
 
@@ -1752,7 +1675,7 @@ const server = http.createServer((req, res) => {
       o.status = 'closed';
       const tr = {
         n:isPaper?++S.papT:++S.liveT, time:new Date().toISOString().slice(11,19),
-        dur:o.openAt?`${o.openAt}→${new Date().toISOString().slice(11,19)}`:'',
+        dur:o.openAt?`${o.openAt}->${new Date().toISOString().slice(11,19)}`:'',
         pair:S.pair, strat:o.strat, isPaper, side:'MANUAL',
         entryPx:o.entryPx, exitPx:px, amt:o.amt,
         fee:+fee.toFixed(6), gross:+gross.toFixed(6), net:+net.toFixed(6)
@@ -1790,8 +1713,13 @@ const server = http.createServer((req, res) => {
       if(d.aiInterval)S.aiInterval= parseInt(d.aiInterval)||30;
       if(d.aiMinConf) S.aiMinConf = parseInt(d.aiMinConf)||65;
       save();
-      log(`🤖 AI Brain activated: mode=${S.aiMode} interval=${S.aiInterval}s minConf=${S.aiMinConf}%`, 'info');
-      log(`💰 Cost estimate: ~$${(0.28/1000000*120*(86400/S.aiInterval)).toFixed(4)}/day`, 'info');
+      // Reset last call timestamps so AI runs immediately
+      S.aiLastCall = 0; S.aiFutLastCall = 0;
+      S.aiDecision = null; S.aiFutDecision = null;
+      log(`🤖 AI AGENT ACTIVATED: mode=${S.aiMode} interval=${S.aiInterval}s minConf=${S.aiMinConf}%`, 'info');
+      log(`📊 Modes: ai-only=AI drives ALL entries | hybrid=AI+signals both agree | off=signals only`, 'info');
+      log(`💰 Cost: ~$${(0.28/1000000*150*(86400/S.aiInterval)).toFixed(4)}/day | DeepSeek deepseek-chat`, 'info');
+      if (S.aiMode === 'ai-only') log(`⚡ AI-ONLY MODE: Indicators ignored. AI decides every trade.`, 'buy');
       send(res,200,{ok:true, mode:S.aiMode, interval:S.aiInterval, minConf:S.aiMinConf});
       return;
     }
@@ -1904,3 +1832,4 @@ server.listen(PORT, '0.0.0.0', () => {
 server.on('error', e => { console.error(e); process.exit(1); });
 process.on('SIGTERM', ()=>{ save(); process.exit(0); });
 process.on('SIGINT',  ()=>{ save(); process.exit(0); });
+};
