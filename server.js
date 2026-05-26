@@ -89,6 +89,18 @@ let S = {
   liveOrders:[], papOrders:[], liveTrades:[], papTrades:[],
   log:[], prices:{},
   lastPx:0, startedAt:null, savedAt:null, lastEntry:0, lastLiveEntry:0, mexcBalance:null,
+  // ── AI BRAIN (DeepSeek) ──────────────────────────────────────────────────
+  aiKey:         '',          // DeepSeek API key
+  aiMode:        'hybrid',    // 'off' | 'hybrid' (AI+signals) | 'ai-only'
+  aiInterval:    30,          // seconds between AI calls
+  aiMinConf:     65,          // minimum confidence % to enter (0-100)
+  aiDecision:    null,        // last AI decision object
+  aiLastCall:    0,           // timestamp of last AI call
+  aiCallCount:   0,           // total AI calls made
+  aiTokensUsed:  0,           // tokens consumed (cost tracking)
+  aiCost:        0,           // estimated cost in USD
+  aiFutDecision: null,        // separate futures AI decision
+  aiFutLastCall: 0,
 
   // ── FUTURES STATE ──────────────────────────────────────────────────────────
   futuresOn:    false,          // futures bot running
@@ -403,7 +415,7 @@ function minTP(entryPx, amt) {
 }
 
 // ── MAIN TICK ─────────────────────────────────────────────────────────────────
-function onTick(px) {
+async function onTick(px) {
   S.lastPx = px;
   ticks++;
 
@@ -435,7 +447,21 @@ function onTick(px) {
     if (I) log(`[T${ticks}] $${px.toFixed(4)} RSI=${I.rsi14.toFixed(1)} dip=${I.dipFromHi.toFixed(3)}% ch1=${I.ch1.toFixed(4)}% sig=${sig.signal}`, 'info');
   }
 
-  if (!sig.signal) return;
+  if (!sig.signal) {
+    // Still call AI in background even when no signal (so decision is fresh)
+    if (S.aiKey && S.aiMode !== 'off') callDeepSeek(px, false);
+    return;
+  }
+
+  // Call AI and check its decision
+  if (S.aiKey && S.aiMode !== 'off') {
+    await callDeepSeek(px, false);
+  }
+  if (!aiSignalOk(false)) {
+    const d = S.aiDecision;
+    if (d) log(`🤖 AI BLOCKED entry: ${d.action} conf=${d.confidence}% (min=${S.aiMinConf}%) — ${d.reason}`, 'info');
+    return;
+  }
 
   // ENTER
   const papOpen = S.papOrders.filter(o=>o.status==='open').length;
@@ -773,7 +799,7 @@ async function fetchFuturesPrice() {
 }
 
 // ── FUTURES TICK ──────────────────────────────────────────────────────────────
-function onFuturesTick(px) {
+async function onFuturesTick(px) {
   S.futLastPx = px;
   futTicks++;
   S.futTicks = futTicks;
@@ -802,7 +828,20 @@ function onFuturesTick(px) {
     log(`[FUT T${futTicks}] $${px.toFixed(2)} sig=${sig.signal} ${sig.reason}`, 'info');
   }
 
-  if (!sig.signal) return;
+  if (!sig.signal) {
+    if (S.aiKey && S.aiMode !== 'off') callDeepSeek(px, true);
+    return;
+  }
+
+  // AI check for futures
+  if (S.aiKey && S.aiMode !== 'off') {
+    await callDeepSeek(px, true);
+  }
+  if (!aiSignalOk(true)) {
+    const d = S.aiFutDecision;
+    if (d) log(`🤖 AI BLOCKED futures entry: ${d.action} conf=${d.confidence}% — ${d.reason}`, 'info');
+    return;
+  }
 
   // Enter paper futures always
   const papOpen = S.futPapOrders.filter(o=>o.status==='open').length;
@@ -1209,6 +1248,191 @@ function calcBB(arr,n=20){
   return{upper:m+2*sd,middle:m,lower:m-2*sd};
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// AI BRAIN — DeepSeek Integration
+// Analyzes market conditions every 30s and returns BUY/HOLD/AVOID + reasoning
+// Cost: ~$0.001 per analysis (deepseek-chat model)
+// ══════════════════════════════════════════════════════════════════════════════
+
+function buildMarketContext(px, isFutures) {
+  const raw   = isFutures ? futPX : PX.map(p=>p.px||p);
+  const n     = raw.length;
+  if (n < 5) return null;
+
+  const r14   = calcRSI(raw, 14);
+  const r9    = calcRSI(raw, 9);
+  const e9    = calcEMA(raw, Math.min(9,n));
+  const e21   = calcEMA(raw, Math.min(21,n));
+  const bb    = calcBB(raw, Math.min(20,n));
+  const hi10  = Math.max(...raw.slice(-10));
+  const lo10  = Math.min(...raw.slice(-10));
+  const dip   = ((px-hi10)/hi10*100).toFixed(3);
+  const ch1   = n>1 ? ((px-raw[n-2])/raw[n-2]*100).toFixed(4) : '0';
+  const ch5   = n>5 ? ((px-raw[n-6])/raw[n-6]*100).toFixed(4) : '0';
+  const trend = e9>e21 ? 'UP' : e9<e21 ? 'DOWN' : 'FLAT';
+  const bbPos = bb ? (px<bb.lower?'BELOW_LOWER':px>bb.upper?'ABOVE_UPPER':px<bb.middle?'LOWER_HALF':'UPPER_HALF') : 'UNKNOWN';
+
+  // Last 5 trade results
+  const trades = isFutures ? S.futTrades : S.liveTrades;
+  const lastResults = trades.slice(0,5).map(t=>t.side+(t.net>=0?'✓':'✗')).join(' ');
+  // Recent 10 prices (compact)
+  const recentPx = raw.slice(-10).map(p=>parseFloat(p).toFixed(0)).join(',');
+
+  return {
+    pair: isFutures ? S.futPair : S.pair,
+    price: px,
+    rsi14: r14.toFixed(1), rsi9: r9.toFixed(1),
+    ema: trend,
+    bb: bbPos,
+    dip1min: dip,
+    tick1s: ch1, tick5s: ch5,
+    bbLower: bb?.lower.toFixed(2)||'?',
+    bbUpper: bb?.upper.toFixed(2)||'?',
+    recent10px: recentPx,
+    lastTrades: lastResults||'none yet',
+    lev: isFutures ? S.futLeverage+'x' : '1x (spot)',
+    fee: isFutures ? '0.04% RT' : '0.10% RT',
+    tpTarget: isFutures ? S.futTpPct+'%' : S.tpPct+'%',
+    slTarget: isFutures ? S.futSlPct+'%' : S.slPct+'%'
+  };
+}
+
+function buildPrompt(ctx) {
+  return `You are an expert crypto scalp trader. Analyze this ${ctx.pair} market snapshot and decide whether to open a LONG position RIGHT NOW.
+
+MARKET DATA:
+- Price: $${ctx.price} | Pair: ${ctx.pair}
+- RSI-14: ${ctx.rsi14} | RSI-9: ${ctx.rsi9}
+- EMA trend: ${ctx.ema} (EMA9 vs EMA21)
+- Bollinger Band position: ${ctx.bb} (lower=$${ctx.bbLower}, upper=$${ctx.bbUpper})
+- Dip from 10-tick high: ${ctx.dip1min}%
+- Price change last 1.5s: ${ctx.tick1s}% | last 7.5s: ${ctx.tick5s}%
+- Recent 10 prices: ${ctx.recent10px}
+- Last 5 trade results: ${ctx.lastTrades}
+- Trade params: TP=${ctx.tpTarget} SL=${ctx.slTarget} Fee=${ctx.fee} Leverage=${ctx.lev}
+
+RULES:
+- BUY only when there is a high-probability reversal or continuation up
+- AVOID if RSI>70 (overbought), price is falling fast, or trend is strongly down
+- HOLD if uncertain — missing a trade is better than a bad trade
+- Consider fees: need ${ctx.tpTarget} price move to profit
+
+Respond ONLY with this exact JSON (no other text):
+{"action":"BUY","confidence":75,"reason":"brief 1-sentence reason","risk":"low|med|high"}
+or
+{"action":"HOLD","confidence":80,"reason":"brief reason","risk":"low|med|high"}`;
+}
+
+async function callDeepSeek(px, isFutures) {
+  if (!S.aiKey) return;
+  const ctx = buildMarketContext(px, isFutures);
+  if (!ctx) return;
+
+  const now = Date.now();
+  const lastCall = isFutures ? S.aiFutLastCall : S.aiLastCall;
+  if (now - lastCall < S.aiInterval * 1000) return; // respect interval
+
+  if (isFutures) S.aiFutLastCall = now; else S.aiLastCall = now;
+  S.aiCallCount++;
+
+  const prompt = buildPrompt(ctx);
+
+  return new Promise(resolve => {
+    const body = JSON.stringify({
+      model: 'deepseek-chat',
+      messages: [
+        {role:'system', content:'You are an expert crypto scalp trader. Always respond with valid JSON only.'},
+        {role:'user',   content: prompt}
+      ],
+      max_tokens: 120,
+      temperature: 0.1,   // low temp = consistent, logical decisions
+      stream: false
+    });
+
+    const req = https.request({
+      hostname: 'api.deepseek.com',
+      path:     '/v1/chat/completions',
+      method:   'POST',
+      headers: {
+        'Authorization': `Bearer ${S.aiKey}`,
+        'Content-Type':  'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      },
+      timeout: 10000
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        try {
+          const resp = JSON.parse(d);
+          if (resp.error) {
+            log(`AI error: ${resp.error.message}`, 'err');
+            resolve(null); return;
+          }
+          const raw = resp.choices?.[0]?.message?.content || '';
+          // Track token usage and cost
+          const tokens = resp.usage?.total_tokens || 0;
+          S.aiTokensUsed += tokens;
+          S.aiCost = parseFloat((S.aiTokensUsed / 1000000 * 0.28).toFixed(6)); // $0.28/1M tokens
+
+          // Parse AI response JSON
+          const jsonMatch = raw.match(/\{[\s\S]*\}/);
+          if (!jsonMatch) { resolve(null); return; }
+          const decision = JSON.parse(jsonMatch[0]);
+          decision.ts = new Date().toISOString().slice(11,19);
+          decision.price = px;
+          decision.tokens = tokens;
+
+          if (isFutures) S.aiFutDecision = decision;
+          else           S.aiDecision    = decision;
+
+          // Log AI decision with appropriate emoji
+          const emoji = decision.action==='BUY'?'🤖 AI BUY':'🤖 AI HOLD';
+          const conf  = decision.confidence||0;
+          log(`${emoji} conf=${conf}% | ${decision.reason} | risk=${decision.risk} | tokens=${tokens}`,
+              decision.action==='BUY'&&conf>=(S.aiMinConf||65) ? 'buy' : 'info');
+
+          resolve(decision);
+        } catch(e) {
+          log(`AI parse error: ${e.message}`, 'err');
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', e => { log(`AI network error: ${e.message}`, 'err'); resolve(null); });
+    req.on('timeout', () => { req.destroy(); log('AI timeout', 'err'); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
+
+function aiSignalOk(isFutures) {
+  if (S.aiMode === 'off') return true; // AI disabled → pass through
+
+  const decision = isFutures ? S.aiFutDecision : S.aiDecision;
+  const minConf  = S.aiMinConf || 65;
+
+  if (!decision) {
+    // No AI decision yet — in hybrid mode allow first entry, in ai-only block
+    return S.aiMode !== 'ai-only';
+  }
+
+  // Decision is stale if older than 2 intervals
+  const age = Date.now() - (isFutures ? S.aiFutLastCall : S.aiLastCall);
+  if (age > S.aiInterval * 2000) {
+    return S.aiMode !== 'ai-only'; // stale = fallback to signals
+  }
+
+  if (S.aiMode === 'ai-only') {
+    return decision.action === 'BUY' && decision.confidence >= minConf;
+  }
+
+  // hybrid: AI must say BUY with at least minConf confidence
+  if (decision.action !== 'BUY') return false;
+  if (decision.confidence < minConf) return false;
+  return true;
+}
+
 // ── CORS + JSON HELPER ────────────────────────────────────────────────────────
 function setHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin','*');
@@ -1299,6 +1523,16 @@ const server = http.createServer((req, res) => {
       log:S.log.slice(0,150),
       hasApiKeys:!!(S.apiKey&&S.apiSecret), mexcBalance:S.mexcBalance||null,
       startedAt:S.startedAt, savedAt:S.savedAt, feeRt:RT_FEE*100,
+      // AI Brain status
+      aiEnabled:  !!(S.aiKey),
+      aiMode:     S.aiMode,
+      aiInterval: S.aiInterval,
+      aiMinConf:  S.aiMinConf,
+      aiDecision: S.aiDecision,
+      aiFutDecision: S.aiFutDecision,
+      aiCallCount: S.aiCallCount,
+      aiTokensUsed: S.aiTokensUsed,
+      aiCost:     S.aiCost,
       // Futures status
       futuresOn:S.futuresOn, futMode:S.futMode, futPair:S.futPair,
       futCapital:S.futCapital, futMaxPos:S.futMaxPos, futLeverage:S.futLeverage,
@@ -1546,6 +1780,29 @@ const server = http.createServer((req, res) => {
       log(`🖱 MANUAL CLOSE futures @ $${px.toFixed(2)} NET=${net>=0?'+':''}$${net.toFixed(4)}`,'info');
       save();
       send(res, 200, {ok:true, net, fee, exitPx:px}); return;
+    }
+
+    // /setaikey — save DeepSeek API key
+    if (url === '/setaikey') {
+      if (!d.aiKey) { send(res,400,{error:'aiKey required'}); return; }
+      S.aiKey = d.aiKey.trim();
+      if(d.aiMode)    S.aiMode    = d.aiMode;
+      if(d.aiInterval)S.aiInterval= parseInt(d.aiInterval)||30;
+      if(d.aiMinConf) S.aiMinConf = parseInt(d.aiMinConf)||65;
+      save();
+      log(`🤖 AI Brain activated: mode=${S.aiMode} interval=${S.aiInterval}s minConf=${S.aiMinConf}%`, 'info');
+      log(`💰 Cost estimate: ~$${(0.28/1000000*120*(86400/S.aiInterval)).toFixed(4)}/day`, 'info');
+      send(res,200,{ok:true, mode:S.aiMode, interval:S.aiInterval, minConf:S.aiMinConf});
+      return;
+    }
+
+    // /aidecision — get latest AI decision manually triggered
+    if (url === '/aidecision') {
+      if (!S.aiKey) { send(res,400,{error:'No AI key set'}); return; }
+      const px = d.isFutures ? (S.futLastPx||S.lastPx) : S.lastPx;
+      const decision = await callDeepSeek(px, !!d.isFutures);
+      send(res,200,{ok:true, decision: decision||S.aiDecision, futDecision: S.aiFutDecision});
+      return;
     }
 
     // /startfutures
