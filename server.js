@@ -720,19 +720,41 @@ async function callAI(px, isFutures) {
   p += 'Dip=' + dip + '% ch1=' + ch1 + '%\n';
   if (bb) p += 'BB lower=$' + bb.lower.toFixed(2) + ' mid=$' + bb.middle.toFixed(2) + ' upper=$' + bb.upper.toFixed(2) + '\n';
   p += 'Settings: TP=' + tp + '% SL=' + sl + '% fee=' + fee + '\n';
+
+  // Include open positions so AI can decide to close them
+  var openPos = (isFutures
+    ? [...S.futOrders,...S.futPapOrders]
+    : [...S.liveOrders,...S.papOrders]).filter(function(o){return o.status==='open';});
+  if (openPos.length > 0) {
+    p += 'OPEN POSITIONS (you can close any of these):\n';
+    openPos.forEach(function(o,i) {
+      var isLng = o.direction !== 'SHORT';
+      var curNet = isFutures
+        ? futFee(o.entryPx, px, o.margin||10, o.leverage||3, isLng).net
+        : feeMath(o.entryPx, px, o.amt||10).net;
+      var movePct = ((px - o.entryPx)/o.entryPx*100).toFixed(3);
+      p += '  pos['+i+']: '+(o.direction||'LONG')+' entry=$'+o.entryPx.toFixed(2)+
+           ' TP=$'+o.tp.toFixed(2)+' SL=$'+o.sl.toFixed(2)+
+           ' pnl='+(curNet>=0?'+':'')+'$'+curNet.toFixed(4)+
+           ' move='+movePct+'%'+(o.isPaper?' paper':' LIVE')+'\n';
+    });
+    p += 'close_positions: array of pos indexes to CLOSE NOW. Empty=hold all.\n';
+  }
+
   p += 'Rules:\n';
   if (isFutures) {
-    p += '- BUY (long): RSI<50, dip from high, price bouncing up, EMA bullish -> enter long\n';
-    p += '- SHORT (short): RSI>60, price at recent high, EMA bearish, dropping -> enter short\n';
-    p += '- HOLD: RSI 50-60, sideways, unclear direction, recent losses -> skip\n';
-    p += '- Target SMALL profits: tp_suggest 0.25-0.45%, sl_suggest 0.15-0.30%\n';
-    p += '- Prioritize: take many small wins rather than waiting for big moves\n';
+    p += '- BUY: RSI<50, dip from high, bouncing up -> enter long\n';
+    p += '- SHORT: RSI>60, at recent high, EMA bearish -> enter short\n';
+    p += '- HOLD: sideways/unclear -> skip new entry\n';
+    p += '- Close open positions if market reversed against them\n';
+    p += '- Small profits target: tp_suggest 0.25-0.40%, sl_suggest 0.15-0.25%\n';
   } else {
     p += '- BUY: RSI<50, bouncing from dip, EMA uptrend -> enter\n';
-    p += '- HOLD: RSI>65, falling, or unclear -> skip\n';
+    p += '- HOLD: RSI>65, falling -> skip\n';
+    p += '- Close open positions if market reversed against them\n';
   }
   p += '- If last 3 trades all losses: be conservative, HOLD\n';
-  p += 'Reply ONLY with JSON: {"action":"BUY","confidence":75,"reason":"short","risk":"low|med|high","tp_suggest":0.45,"sl_suggest":0.20}';
+  p += 'Reply ONLY valid JSON: {"action":"BUY","confidence":75,"reason":"short reason","risk":"low","tp_suggest":0.35,"sl_suggest":0.20,"close_positions":[]}';
 
   return new Promise(resolve => {
     const body = JSON.stringify({
@@ -762,7 +784,62 @@ async function callAI(px, isFutures) {
           dec.ts = new Date().toISOString().slice(11,19);
           dec.price = px; dec.tokens = tokens;
           if (isFutures) S.aiFutDecision = dec; else S.aiDecision = dec;
-          const emoji = dec.action==='BUY'?'AI-BUY':dec.action==='SHORT'?'AI-SHORT':'AI-HOLD';
+
+          // AI EXIT: close positions AI flagged
+          if (Array.isArray(dec.close_positions) && dec.close_positions.length > 0) {
+            var livePos  = (isFutures ? S.futOrders    : S.liveOrders).filter(function(o){return o.status==='open';});
+            var paperPos = (isFutures ? S.futPapOrders : S.papOrders).filter(function(o){return o.status==='open';});
+            var allPos   = livePos.concat(paperPos);
+            dec.close_positions.forEach(function(idx) {
+              var o = allPos[idx];
+              if (!o || o.status !== 'open') return;
+              var isLng  = o.direction !== 'SHORT';
+              var exitPx = px;
+              var result = isFutures
+                ? futFee(o.entryPx, exitPx, o.margin, o.leverage, isLng)
+                : feeMath(o.entryPx, exitPx, o.amt);
+              var net = result.net, fee2 = result.fee;
+              o.status = 'closed';
+              var movePct = ((exitPx-o.entryPx)/o.entryPx*100).toFixed(3);
+              log('AI-CLOSE pos['+idx+'] '+(o.direction||'LONG')+' @ $'+exitPx.toFixed(2)+
+                  ' NET='+(net>=0?'+':'')+'$'+net.toFixed(4)+' | '+dec.reason, net>=0?'profit':'err');
+              if (isFutures) {
+                var trF = {n:o.isPaper?++S.futPapT:++S.futT, time:dec.ts, pair:S.futPair,
+                  direction:o.direction||'LONG', isPaper:o.isPaper, side:'AI-CLOSE',
+                  entryPx:o.entryPx, exitPx:exitPx, margin:o.margin, leverage:o.leverage,
+                  notional:o.notional, move:movePct+'%', leveragedMove:(parseFloat(movePct)*o.leverage).toFixed(3)+'%',
+                  fee:+fee2.toFixed(6), pnl:+(result.pnl||net+fee2).toFixed(6), net:+net.toFixed(6)};
+                if (o.isPaper) {
+                  S.futPapProfit+=net; S.futFees+=fee2; if(net>=0)S.futPapW++;else S.futPapL++;
+                  S.futPapTrades.unshift(trF);
+                } else {
+                  S.futProfit+=net; S.futFees+=fee2; if(net>=0){S.futW++;if(net>S.futBest)S.futBest=net;}else S.futL++;
+                  S.futTrades.unshift(trF);
+                  futPlaceOrder(isLng?'close_long':'close_short', o.margin, o.leverage, exitPx);
+                }
+              } else {
+                var trS = {n:o.isPaper?++S.papT:++S.liveT, time:dec.ts, pair:S.pair,
+                  strat:o.strat, isPaper:o.isPaper, side:'AI-CLOSE',
+                  entryPx:o.entryPx, exitPx:exitPx, amt:o.amt,
+                  fee:+fee2.toFixed(6), gross:+(result.gross||Math.abs(net+fee2)).toFixed(6), net:+net.toFixed(6)};
+                if (o.isPaper) {
+                  S.papProfit+=net; S.papFees+=fee2; if(net>=0){S.papW++;if(net>S.papBest)S.papBest=net;}else S.papL++;
+                  S.papTrades.unshift(trS);
+                } else {
+                  S.liveProfit+=net; S.todayP+=net; S.feesT+=fee2; if(net>=0){S.liveW++;if(net>S.bestT)S.bestT=net;}else S.liveL++;
+                  S.liveTrades.unshift(trS);
+                  placeOrder('SELL', o.qty, S.pair);
+                }
+              }
+            });
+            S.futOrders    = S.futOrders.filter(function(o){return o.status==='open';});
+            S.futPapOrders = S.futPapOrders.filter(function(o){return o.status==='open';});
+            S.liveOrders   = S.liveOrders.filter(function(o){return o.status==='open';});
+            S.papOrders    = S.papOrders.filter(function(o){return o.status==='open';});
+            save();
+          }
+
+          var emoji = dec.action==='BUY'?'AI-BUY':dec.action==='SHORT'?'AI-SHORT':'AI-HOLD';
           log(emoji+' conf='+dec.confidence+'% '+dec.reason+' risk='+dec.risk, dec.action!=='HOLD'&&dec.confidence>=(S.aiMinConf||65)?'buy':'info');
           resolve(dec);
         } catch(e) { log('AI parse err: '+e.message,'err'); resolve(null); }
