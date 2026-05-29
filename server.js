@@ -402,7 +402,7 @@ function closeFutOrder(o,px,why,isPaper){
     entryPx:o.entryPx,exitPx:px,margin:o.margin,leverage:o.leverage,notional:o.notional,
     move:movePct+'%',fee:+r.fee.toFixed(6),pnl:+r.pnl.toFixed(6),net:+r.net.toFixed(6)};
   if(isPaper){S.futPapProfit+=r.net;S.futFees+=r.fee;if(r.net>=0)S.futPapW++;else S.futPapL++;S.futPapTrades.unshift(tr);if(S.futPapTrades.length>200)S.futPapTrades.length=200;}
-  else{S.futProfit+=r.net;S.futFees+=r.fee;if(r.net>=0){S.futW++;if(r.net>S.futBest)S.futBest=r.net;}else S.futL++;S.futTrades.unshift(tr);if(S.futTrades.length>200)S.futTrades.length=200;futPlaceOrder(isLong?'close_long':'close_short',o.margin,o.leverage,px);}
+  else{S.futProfit+=r.net;S.futFees+=r.fee;if(r.net>=0){S.futW++;if(r.net>S.futBest)S.futBest=r.net;}else S.futL++;S.futTrades.unshift(tr);if(S.futTrades.length>200)S.futTrades.length=200;futPlaceOrder(isLong?'close_long':'close_short',o.margin,o.leverage,px,o.contracts);}
   log((isPaper?'CRT-PAP':'CRT-LIVE')+' '+o.direction+' '+why+' @ $'+px.toFixed(2)+' R:R='+(o.crtRR||0)+' NET='+(r.net>=0?'+':'')+'$'+r.net.toFixed(4),r.net>=0?'profit':'err');
 }
 
@@ -494,10 +494,11 @@ function enterCRT(px,crt,isPaper){
   var isLong=crt.direction!=='SHORT';
   var bePx=parseFloat(futBE(px,margin,lev,isLong).toFixed(4));
   var expNet=futFee(px,crt.tp,margin,lev,isLong).net;
+  var contracts=Math.max(1,Math.round(notional/px));
   var o={
     id:Date.now()+(isPaper?1:0),status:'open',isPaper,isFutures:true,
     direction:isLong?'LONG':'SHORT',
-    entryPx:px,margin,leverage:lev,notional,
+    entryPx:px,margin,leverage:lev,notional,contracts,
     tp:crt.tp,sl:crt.sl,bePx,beStopMoved:false,
     peakPx:px,peakNet:0,
     crtType:crt.type,crtRR:crt.rr,
@@ -586,21 +587,63 @@ function placeSpotOrder(side,qty,pair){
   });
   req.on('error',function(e){log('Spot order err: '+e.message,'err');}); req.end();
 }
-function futPlaceOrder(action,margin,lev,px){
+function futPlaceOrder(action,margin,lev,px,contractVol){
   if(!S.apiKey||!S.apiSecret)return;
+  var isClose=action==='close_long'||action==='close_short';
   var side=action==='open_long'?1:action==='close_long'?2:action==='open_short'?3:4;
-  var notional=margin*lev, vol=parseFloat((notional/px).toFixed(0))||1;
+  // CLOSE: use exact contract count. OPEN: calculate from margin
+  var vol=isClose&&contractVol?contractVol:Math.max(1,Math.round((margin*lev)/px));
   var ts=Date.now().toString();
-  var body=JSON.stringify({symbol:S.futPair,price:px,vol,side,type:5,openType:2,marketCeiling:0,priceProtect:0,reduceOnly:false,leverage:lev});
+  var body=JSON.stringify({symbol:S.futPair,price:px,vol:vol,side:side,type:5,openType:2,
+    marketCeiling:0,priceProtect:0,reduceOnly:isClose,leverage:lev});
   var sig=crypto.createHmac('sha256',S.apiSecret).update(S.apiKey+ts+body).digest('hex');
+  var tag=(isClose?'CLOSE':'OPEN')+' '+action.toUpperCase()+' vol='+vol;
+  log('MEXC FUT '+tag+' px=$'+px.toFixed(2),'info');
   var req=https.request({hostname:'contract.mexc.com',path:'/api/v1/private/order/submit',method:'POST',
-    headers:{'ApiKey':S.apiKey,'Request-Time':ts,'Signature':sig,'Content-Type':'application/json'},timeout:8000},function(res){
+    headers:{'ApiKey':S.apiKey,'Request-Time':ts,'Signature':sig,'Content-Type':'application/json','Accept':'application/json'},timeout:8000},function(res){
     var d=''; res.on('data',function(c){d+=c;});
-    res.on('end',function(){try{var r=JSON.parse(d);if(r.success)log('FUT ORDER OK '+action+' id='+r.data,'profit');else log('FUT ORDER FAIL '+r.code+': '+r.message,'err');}catch(e){}});
+    res.on('end',function(){
+      try{
+        var r=JSON.parse(d);
+        if(r.success){
+          log('FUT ORDER OK '+tag+' orderId='+r.data,'profit');
+          if(!isClose)setTimeout(fetchAndLogFutBalance,3000);
+        }else{
+          log('FUT ORDER FAIL code='+r.code+': '+r.message,'err');
+          log('Position may still be open on MEXC! Check app. vol='+vol+' side='+side,'err');
+        }
+      }catch(e){log('FUT order parse err: '+d.slice(0,80),'err');}
+    });
   });
-  req.on('error',function(e){log('Fut order err: '+e.message,'err');});
-  req.on('timeout',function(){req.destroy();});
+  req.on('error',function(e){log('FUT order err: '+e.message,'err');});
+  req.on('timeout',function(){req.destroy();log('FUT order TIMEOUT — check MEXC app!','err');});
   req.write(body); req.end();
+}
+
+function fetchAndLogFutBalance(){
+  if(!S.apiKey||!S.apiSecret)return;
+  var ts2=Date.now().toString();
+  var sig2=crypto.createHmac('sha256',S.apiSecret).update(S.apiKey+ts2+'').digest('hex');
+  var r2=https.request({hostname:'contract.mexc.com',path:'/api/v1/private/account/assets',method:'GET',
+    headers:{'ApiKey':S.apiKey,'Request-Time':ts2,'Signature':sig2},timeout:6000},function(res2){
+    var d2=''; res2.on('data',function(c){d2+=c;});
+    res2.on('end',function(){
+      try{
+        var rb=JSON.parse(d2);
+        if(rb.success&&rb.data){
+          var arr=Array.isArray(rb.data)?rb.data:[rb.data];
+          var u=arr.find(function(a){return a.currency==='USDT';});
+          if(u){
+            var bal=parseFloat(u.availableBalance||0);
+            var eq=parseFloat(u.equity||bal);
+            S.futRealBalance=bal;
+            log('MEXC Futures wallet: avail=$'+bal.toFixed(4)+' equity=$'+eq.toFixed(4),'profit');
+          }
+        }
+      }catch(e){}
+    });
+  });
+  r2.on('error',function(){}); r2.on('timeout',function(){r2.destroy();}); r2.end();
 }
 
 // ── CORS & SEND ───────────────────────────────────────────────────────────────
@@ -754,7 +797,7 @@ const server=http.createServer(function(req,res){
         var fo=futOrds.find(function(o){return String(o.id)===String(d.id)&&o.status==='open';});
         if(!fo){send(res,404,{error:'Not found'});return;}
         var fpx=S.futLastPx||S.lastPx;
-        closeFutOrder(fo,fpx,'MANUAL',!!d.isPaper);
+        fo.contracts=fo.contracts||Math.max(1,Math.round((fo.margin*fo.leverage)/fpx)); closeFutOrder(fo,fpx,'MANUAL',!!d.isPaper);
         if(d.isPaper)S.futPapOrders=S.futPapOrders.filter(function(o){return o.status==='open';});
         else S.futOrders=S.futOrders.filter(function(o){return o.status==='open';});
         save();send(res,200,{ok:true});return;
