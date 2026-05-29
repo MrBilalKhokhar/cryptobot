@@ -396,11 +396,15 @@ function futExitCheck(px,isPaper){
 function closeFutOrder(o,px,why,isPaper){
   var isLong=o.direction!=='SHORT';
   var r=futFee(o.entryPx,px,o.margin,o.leverage,isLong); o.status='closed';
+  var isLng2=o.direction!=='SHORT';
+  // movePct = actual price movement (positive = price went up, negative = price went down)
   var movePct=((px-o.entryPx)/o.entryPx*100).toFixed(3);
+  // levMovePct = leveraged profit direction (positive = trade was profitable)
+  var levMovePct=(isLng2?1:-1)*parseFloat(movePct)*o.leverage;
   var tr={n:isPaper?++S.futPapT:++S.futT,time:new Date().toISOString().slice(11,19),
     pair:S.futPair,direction:o.direction||'LONG',isPaper,side:why,crtType:o.crtType||'',rr:o.crtRR||0,
     entryPx:o.entryPx,exitPx:px,margin:o.margin,leverage:o.leverage,notional:o.notional,
-    move:movePct+'%',fee:+r.fee.toFixed(6),pnl:+r.pnl.toFixed(6),net:+r.net.toFixed(6)};
+    move:movePct+'%',leveragedMove:levMovePct.toFixed(3)+'%',fee:+r.fee.toFixed(6),pnl:+r.pnl.toFixed(6),net:+r.net.toFixed(6)};
   if(isPaper){S.futPapProfit+=r.net;S.futFees+=r.fee;if(r.net>=0)S.futPapW++;else S.futPapL++;S.futPapTrades.unshift(tr);if(S.futPapTrades.length>200)S.futPapTrades.length=200;}
   else{S.futProfit+=r.net;S.futFees+=r.fee;if(r.net>=0){S.futW++;if(r.net>S.futBest)S.futBest=r.net;}else S.futL++;S.futTrades.unshift(tr);if(S.futTrades.length>200)S.futTrades.length=200;futPlaceOrder(isLong?'close_long':'close_short',o.margin,o.leverage,px,o.contracts);}
   log((isPaper?'CRT-PAP':'CRT-LIVE')+' '+o.direction+' '+why+' @ $'+px.toFixed(2)+' R:R='+(o.crtRR||0)+' NET='+(r.net>=0?'+':'')+'$'+r.net.toFixed(4),r.net>=0?'profit':'err');
