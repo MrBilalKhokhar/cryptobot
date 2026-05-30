@@ -145,11 +145,14 @@ function minTpPx(entryPx,amt){
   return be*(1+0.0012);
 }
 function futFee(entryPx,exitPx,margin,lev,isLong){
-  const notional=margin*lev,contracts=notional/entryPx;
-  const rawPnl=(exitPx-entryPx)*contracts;
-  const pnl=isLong===false?-rawPnl:rawPnl;
-  const fee=notional*FUT_TAKER*2;
-  return {net:pnl-fee,fee,pnl,notional,contracts};
+  var notional  = margin*lev;
+  var contracts = notional/entryPx;
+  var rawPnl    = (exitPx-entryPx)*contracts;
+  var pnl       = isLong===false ? -rawPnl : rawPnl;
+  var entryFee  = contracts * entryPx * FUT_TAKER;
+  var exitFee   = contracts * exitPx  * FUT_TAKER;
+  var fee       = entryFee + exitFee;
+  return {net:pnl-fee, fee:fee, pnl:pnl, notional:notional, contracts:contracts};
 }
 function futBE(entryPx,margin,lev,isLong){
   const notional=margin*lev,contracts=notional/entryPx,fee=notional*FUT_RT;
@@ -377,10 +380,12 @@ function futExitCheck(px,isPaper){
   orders.forEach(function(o){
     if(o.status!=='open')return;
     var isLong=o.direction!=='SHORT';
-    var cur=futFee(o.entryPx,px,o.margin,o.leverage,isLong).net;
-    if(cur>(o.peakNet||0))o.peakNet=cur;
-    // Profit protection: in profit, gave back 60%
-    if((o.peakNet||0)>o.margin*0.001&&cur>0&&(o.peakNet-cur)/o.peakNet>=0.60){
+    var futR=futFee(o.entryPx,px,o.margin,o.leverage,isLong);
+    var cur=futR.net;       // net after fees (for profit protection logic)
+    var curRaw=futR.pnl;    // raw pnl like MEXC shows
+    if(curRaw>(o.peakNet||0))o.peakNet=curRaw; // track peak using raw pnl
+    // Profit protection: in profit (raw), gave back 60%
+    if((o.peakNet||0)>o.margin*0.001&&curRaw>0&&(o.peakNet-curRaw)/o.peakNet>=0.60){
       closeFutOrder(o,px,'PROTECT',isPaper); changed=true; return;
     }
     // BE-stop: moved stop to break-even at 40% toward TP
@@ -721,8 +726,8 @@ const server=http.createServer(function(req,res){
       futWR:S.futT>0?Math.round(S.futW/S.futT*100):0,
       futPapProfit:S.futPapProfit,futPapT:S.futPapT,futPapW:S.futPapW,futPapL:S.futPapL,
       futPapWR:S.futPapT>0?Math.round(S.futPapW/S.futPapT*100):0,
-      futOrders:   futLO.map(function(o){var isL=o.direction!=='SHORT';return Object.assign({},o,{livePnl:futFee(o.entryPx,S.futLastPx||S.lastPx,o.margin,o.leverage,isL).net,peakNet:o.peakNet||0});}),
-      futPapOrders:futPO.map(function(o){var isL=o.direction!=='SHORT';return Object.assign({},o,{livePnl:futFee(o.entryPx,S.futLastPx||S.lastPx,o.margin,o.leverage,isL).net,peakNet:o.peakNet||0});}),
+      futOrders:   futLO.map(function(o){var isL=o.direction!=='SHORT';var px2=S.futLastPx||S.lastPx;var r=futFee(o.entryPx,px2,o.margin,o.leverage,isL);return Object.assign({},o,{livePnl:r.pnl,liveNet:r.net,liveFee:r.fee,peakNet:o.peakNet||0});}),
+      futPapOrders:futPO.map(function(o){var isL=o.direction!=='SHORT';var px2=S.futLastPx||S.lastPx;var r=futFee(o.entryPx,px2,o.margin,o.leverage,isL);return Object.assign({},o,{livePnl:r.pnl,liveNet:r.net,liveFee:r.fee,peakNet:o.peakNet||0});}),
       futTrades:S.futTrades.slice(0,60),futPapTrades:S.futPapTrades.slice(0,60),
       // CRT stats
       crtStats:S.crtStats,crtCandleSize:S.crtCandleSize,
