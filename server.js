@@ -41,6 +41,11 @@ let S = {
   futPapProfit:0, futPapT:0, futPapW:0, futPapL:0,
   futOrders:[], futPapOrders:[], futTrades:[], futPapTrades:[],
   futLastPx:0, futLastEntry:0, futCooldown:6000,
+  // Compounding
+  compoundEnabled: false,   // auto-reinvest profits
+  compoundPct:     100,     // % of profit to reinvest (1-100)
+  futBaseCapital:  20,      // original capital before compounding
+  futCompounded:   0,       // total amount reinvested so far
   // CRT Engine
   crtCandleSize:40, crtCandles:[], crtCurrentCandle:null,
   crtLastSignal:null, crtStats:{setups:0,confirmed:0,entered:0},
@@ -919,6 +924,27 @@ const server=http.createServer(function(req,res){
         return;
       }
       // ── AI DECISION ────────────────────────────────────────────────────────
+      if(url==='/setcompound'){
+        S.compoundEnabled = !!d.enabled;
+        if(d.pct !== undefined) S.compoundPct = Math.min(100, Math.max(1, parseInt(d.pct)||100));
+        if(!S.compoundEnabled) {
+          log('Compounding DISABLED. Capital stays at $'+S.futCapital.toFixed(2),'info');
+        } else {
+          S.futBaseCapital = S.futCapital; // snapshot base
+          log('Compounding ENABLED: reinvesting '+S.compoundPct+'% of each profit','profit');
+          log('Base capital: $'+S.futBaseCapital.toFixed(2)+' | Will grow with each win','info');
+        }
+        save();
+        send(res,200,{ok:true,enabled:S.compoundEnabled,pct:S.compoundPct,
+          capital:S.futCapital,baseCapital:S.futBaseCapital,totalCompounded:S.futCompounded});
+        return;
+      }
+      if(url==='/resetcompound'){
+        S.futCapital = S.futBaseCapital || S.futCapital;
+        S.futCompounded = 0;
+        log('Compound reset. Capital back to base: $'+S.futCapital.toFixed(2),'info');
+        save(); send(res,200,{ok:true,capital:S.futCapital}); return;
+      }
       if(url==='/aidecision'){
         if(!S.aiKey){send(res,200,{ok:false,error:'No AI key set. Go to AI Brain tab and save DeepSeek key first.'});return;}
         var diagPx = S.futLastPx||S.lastPx;
