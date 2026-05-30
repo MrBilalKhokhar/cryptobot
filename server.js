@@ -261,53 +261,97 @@ async function callDeepSeek(prompt){
 }
 
 async function aiConfirmCRT(px,crt){
-  const raw=(futPX.filter(v=>v>0));
-  const n=raw.length;
-  const r14=n>2?calcRSI(raw,Math.min(14,n-1)).toFixed(1):'50';
-  const e9=n>0?calcEMA(raw,Math.min(9,n)).toFixed(2):px.toFixed(2);
-  const e21=n>0?calcEMA(raw,Math.min(21,n)).toFixed(2):px.toFixed(2);
-  const trend=parseFloat(e9)>parseFloat(e21)*1.0002?'UPTREND':parseFloat(e9)<parseFloat(e21)*0.9998?'DOWNTREND':'SIDEWAYS';
-  const streak=S.futTrades.slice(0,3).filter(t=>t.net<0).length;
-  const targetLots=calcLots(S.futCapital/S.futMaxPos*S.futLeverage,px);
-  const actualNotional=targetLots*MEXC_LOT_BTC*px;
+  // STRICT: AI confirmation is MANDATORY. No fallbacks. No trades without AI.
+  if(!S.aiKey){
+    log('CRT BLOCKED: No DeepSeek API key. Add key in AI Brain tab first.','err');
+    return {confirmed:false,tp:0,sl:0,confidence:0,reason:'No AI key'};
+  }
+  const raw=futPX.filter(v=>v>0); const n=raw.length;
+  const r14=n>2?calcRSI(raw,Math.min(14,n-1)):50;
+  const r9 =n>2?calcRSI(raw,Math.min(9,n-1)) :50;
+  const e9 =n>0?calcEMA(raw,Math.min(9,n))   :px;
+  const e21=n>0?calcEMA(raw,Math.min(21,n))  :px;
+  const bb =n>=10?calcBB(raw,Math.min(20,n)) :null;
+  const hi10=n>0?Math.max.apply(null,raw.slice(-Math.min(10,n))):px;
+  const lo10=n>0?Math.min.apply(null,raw.slice(-Math.min(10,n))):px;
+  const ch1=n>1?((px-raw[n-2])/raw[n-2]*100).toFixed(3):'0';
+  const trend=e9>e21*1.0002?'UPTREND':e9<e21*0.9998?'DOWNTREND':'SIDEWAYS';
+  const bbPos=bb?(px<=bb.lower*1.002?'AT_SUPPORT':px>=bb.upper*0.998?'AT_RESISTANCE':px<bb.middle?'LOWER_HALF':'UPPER_HALF'):'UNKNOWN';
+  const streak=S.futTrades.slice(0,3).filter(function(t){return t.net<0;}).length;
+  const wr=S.futT>0?Math.round(S.futW/S.futT*100):0;
+  const lots=calcLots((S.futCapital/S.futMaxPos)*S.futLeverage,px);
+  const notional=lots*MEXC_LOT_BTC*px;
+  const recent=S.futTrades.slice(0,5).map(function(t){return t.direction+' '+t.side+(t.net>=0?'+':'')+t.net.toFixed(3);}).join(', ')||'none';
 
-  let p='You are confirming a CRT futures trade on MEXC. Respond with JSON only.\n\n';
-  p+='CRT SIGNAL:\n';
-  p+='Type: '+crt.type+'\n';
-  p+='Direction: '+crt.direction+' ('+( crt.direction==='BUY'?'LONG':'SHORT')+')\n';
-  p+='Entry price: $'+px.toFixed(2)+'\n';
-  p+='Candle range: '+crt.prevRange+'% | Sweep depth: '+crt.sweepDepth+'%\n';
-  p+='Proposed TP: $'+crt.tp+' (+'+crt.tpPct+'%) | R:R: '+crt.rr+'x\n';
-  p+='Proposed SL: $'+crt.sl+' (-'+crt.slPct+'%)\n';
-  p+='Position size: '+targetLots+' lots = '+actualNotional.toFixed(2)+' USDT notional\n\n';
-  p+='MARKET CONTEXT:\n';
-  p+='Price: $'+px.toFixed(2)+' | RSI-14: '+r14+' | EMA trend: '+trend+'\n';
-  p+='EMA9: $'+e9+' vs EMA21: $'+e21+'\n';
-  p+='Recent loss streak: '+streak+'/3\n';
-  p+='Bot P&L: $'+S.futProfit.toFixed(4)+' | Trades: '+S.futT+' | Win rate: '+(S.futT>0?Math.round(S.futW/S.futT*100):0)+'%\n\n';
-  p+='YOUR TASK: Decide whether to CONFIRM or REJECT this CRT trade. If confirmed, set optimal TP and SL.\n\n';
-  p+='CONFIRM if: R:R >= 1.0, RSI not extreme, sweep was clean, trend supports direction\n';
-  p+='REJECT if: RSI overbought (>70) for BUY, RSI oversold (<30) for SHORT, 3+ recent losses\n';
-  p+='ADJUST TP/SL: Set TP/SL to exact price levels (not %) based on market structure\n\n';
-  p+='Reply ONLY with JSON:\n';
-  p+='{"confirmed":true,"tp":103250.50,"sl":102780.00,"confidence":82,"reason":"clean sweep RSI 45 neutral trend supports long","risk":"low"}';
+  var p='';
+  p+='=== MANDATORY CRT TRADE REVIEW ===\n';
+  p+='You are the ONLY decision maker. Trade executes ONLY if you confirm.\n';
+  p+='Set EXACT TP and SL price levels that maximize profit.\n\n';
+  p+='=== CRT SETUP ===\n';
+  p+='Type: '+crt.type+' | Direction: '+crt.direction+(crt.direction==='BUY'?' (LONG)':' (SHORT)')+'\n';
+  p+='Entry: $'+px.toFixed(2)+'\n';
+  p+='Prev candle: H=$'+(S.crtCandles[0]?S.crtCandles[0].h.toFixed(2):'?')+' L=$'+(S.crtCandles[0]?S.crtCandles[0].l.toFixed(2):'?')+' Range='+crt.prevRange+'%\n';
+  p+='Sweep: '+crt.sweepDepth+'% beyond level\n';
+  p+='CRT levels: TP=$'+crt.tp.toFixed(2)+' (+'+crt.tpPct+'%) SL=$'+crt.sl.toFixed(2)+' (-'+crt.slPct+'%) R:R='+crt.rr+'x\n\n';
+  p+='=== POSITION ===\n';
+  p+='Lots: '+lots+' ('+MEXC_LOT_BTC+' BTC/lot) | Notional: $'+notional.toFixed(2)+' | Leverage: '+S.futLeverage+'x\n';
+  p+='RT fee: $'+(notional*FUT_TAKER*2).toFixed(4)+' | Min TP to profit: fee+0.1% move\n\n';
+  p+='=== MARKET ===\n';
+  p+='Price: $'+px.toFixed(2)+' | Trend: '+trend+' | BB: '+bbPos+'\n';
+  p+='RSI14='+r14.toFixed(1)+' RSI9='+r9.toFixed(1)+' | ch1='+ch1+'%\n';
+  p+='EMA9=$'+e9.toFixed(2)+' EMA21=$'+e21.toFixed(2)+'\n';
+  if(bb)p+='BB: L=$'+bb.lower.toFixed(2)+' M=$'+bb.middle.toFixed(2)+' H=$'+bb.upper.toFixed(2)+'\n';
+  p+='10-tick: $'+lo10.toFixed(2)+'-$'+hi10.toFixed(2)+'\n\n';
+  p+='=== ACCOUNT ===\n';
+  p+='P&L: $'+S.futProfit.toFixed(4)+' | WR: '+wr+'% ('+S.futW+'W/'+S.futL+'L) | Loss streak: '+streak+'\n';
+  p+='Recent: '+recent+'\n\n';
+  p+='=== CONFIRM WHEN ===\n';
+  p+='- BUY: RSI<60, AT_SUPPORT or LOWER_HALF, bounce confirmed, R:R>=1.0\n';
+  p+='- SHORT: RSI>40, AT_RESISTANCE or UPPER_HALF, rejection confirmed, R:R>=1.0\n';
+  p+='- Sweep clean (>0.005%), trend supports or neutral\n\n';
+  p+='=== REJECT WHEN ===\n';
+  p+='- BUY: RSI>70 (overbought), strong DOWNTREND, AT_RESISTANCE\n';
+  p+='- SHORT: RSI<30 (oversold), strong UPTREND, AT_SUPPORT\n';
+  p+='- Loss streak=3 AND confidence<75%, sweep<0.003%\n\n';
+  p+='=== SET EXACT PRICES ===\n';
+  p+='TP = price where you take profit (CRT target = opposite side of candle)\n';
+  p+='SL = price where you stop loss (just beyond the sweep wick)\n';
+  p+='Both must be valid: LONG needs TP>entry>SL, SHORT needs TP<entry<SL\n\n';
+  p+='Reply ONLY with JSON (confirmed=false means trade is skipped):\n';
+  p+='{"confirmed":true,"tp":103250.50,"sl":102780.00,"confidence":82,"reason":"brief reason","risk":"low"}\n';
+  p+='{"confirmed":false,"tp":0,"sl":0,"confidence":30,"reason":"RSI overbought reject","risk":"high"}';
 
-  const dec=await callDeepSeek(p);
-  if(!dec)return {confirmed:true,tp:crt.tp,sl:crt.sl,confidence:65,reason:'AI timeout - using CRT levels'};
+  log('Asking DeepSeek AI to review CRT setup...','info');
+  var dec=await callDeepSeek(p);
 
-  S.aiFutDecision={action:crt.direction,confirmed:dec.confirmed,confidence:dec.confidence||65,
-    reason:dec.reason||'',tp:dec.tp||crt.tp,sl:dec.sl||crt.sl,
+  if(!dec){
+    log('AI TIMEOUT — CRT trade SKIPPED (no fallback in strict mode)','err');
+    S.aiFutDecision={action:crt.direction,confirmed:false,confidence:0,reason:'AI timeout - trade skipped',ts:new Date().toISOString().slice(11,19),price:px};
+    return {confirmed:false,tp:0,sl:0,confidence:0,reason:'AI timeout'};
+  }
+
+  var aiTp=parseFloat(dec.tp||0),aiSl=parseFloat(dec.sl||0);
+  var aiConf=parseInt(dec.confidence||0),aiOk=!!dec.confirmed;
+  var isLng=crt.direction==='BUY';
+
+  // Validate AI-provided TP/SL make sense for the direction
+  if(aiOk){
+    if(aiTp<=0||aiSl<=0){log('AI confirmed but invalid TP/SL prices — SKIPPING','err');aiOk=false;dec.reason='AI gave no valid TP/SL';}
+    if(isLng&&aiTp<=px){log('AI TP $'+aiTp+' <= entry $'+px.toFixed(2)+' for LONG — SKIPPING','err');aiOk=false;dec.reason='TP below entry for LONG';}
+    if(!isLng&&aiTp>=px){log('AI TP $'+aiTp+' >= entry $'+px.toFixed(2)+' for SHORT — SKIPPING','err');aiOk=false;dec.reason='TP above entry for SHORT';}
+    if(isLng&&aiSl>=px){log('AI SL $'+aiSl+' >= entry $'+px.toFixed(2)+' for LONG — SKIPPING','err');aiOk=false;dec.reason='SL above entry for LONG';}
+    if(!isLng&&aiSl<=px){log('AI SL $'+aiSl+' <= entry $'+px.toFixed(2)+' for SHORT — SKIPPING','err');aiOk=false;dec.reason='SL below entry for SHORT';}
+  }
+
+  S.aiFutDecision={action:crt.direction,confirmed:aiOk,confidence:aiConf,reason:dec.reason||'',
+    risk:dec.risk||'med',tp:aiTp,sl:aiSl,crtType:crt.type,sweepDepth:crt.sweepDepth,rr:crt.rr,
     ts:new Date().toISOString().slice(11,19),price:px};
-  S.aiFutLastCall=Date.now();
+  S.aiFutLastCall=Date.now(); S.aiCallCount++;
 
-  return {
-    confirmed:!!dec.confirmed,
-    tp:parseFloat((dec.tp||crt.tp).toFixed(4)),
-    sl:parseFloat((dec.sl||crt.sl).toFixed(4)),
-    confidence:dec.confidence||65,
-    reason:dec.reason||''
-  };
+  log('DeepSeek: '+(aiOk?'CONFIRMED':'REJECTED')+' conf='+aiConf+'% | '+dec.reason,'info');
+  return {confirmed:aiOk,tp:parseFloat(aiTp.toFixed(4)),sl:parseFloat(aiSl.toFixed(4)),confidence:aiConf,reason:dec.reason||''};
 }
+
 
 // AI sets TP/SL for synced positions
 async function aiSetTpSlForPosition(o){
@@ -422,32 +466,32 @@ async function _processFutTick(px){
     }
     return;
   }
-  // LOCK immediately
+  // LOCK immediately — block all other ticks while DeepSeek is being consulted
   futEntering=true;
   S.futLastEntry=now;
-  log('CRT: '+crt.type+' sweep='+crt.sweepDepth+'% TP=$'+crt.tp+' SL=$'+crt.sl+' R:R='+crt.rr+'x','buy');
+  log('CRT DETECTED: '+crt.type+' sweep='+crt.sweepDepth+'% R:R='+crt.rr+'x | asking DeepSeek AI...','buy');
   try{
-    // AI confirms and sets TP/SL
-    let aiResult={confirmed:true,tp:crt.tp,sl:crt.sl,confidence:70,reason:'no AI key'};
-    if(S.aiKey){
-      aiResult=await aiConfirmCRT(px,crt);
-      if(!aiResult.confirmed||(aiResult.confidence||0)<(S.aiMinConf||65)){
-        log('CRT REJECTED: conf='+aiResult.confidence+'% '+aiResult.reason,'info');
-        S.crtLastSignal=Object.assign({},crt,{aiRejected:true,aiReason:aiResult.reason});
-        return;
-      }
-      log('CRT CONFIRMED: conf='+aiResult.confidence+'% '+aiResult.reason,'profit');
+    // STRICT MODE: DeepSeek confirms every trade and sets TP/SL
+    // No AI key = no trade. AI timeout = no trade. AI rejects = no trade.
+    const aiResult=await aiConfirmCRT(px,crt);
+    if(!aiResult.confirmed){
+      log('TRADE SKIPPED: '+aiResult.reason,'info');
+      S.crtLastSignal=Object.assign({},crt,{aiRejected:true,aiReason:aiResult.reason,aiConf:aiResult.confidence});
+      return;
     }
+    if(aiResult.confidence<(S.aiMinConf||65)){
+      log('TRADE SKIPPED: conf '+aiResult.confidence+'% < min '+(S.aiMinConf||65)+'%','info');
+      S.crtLastSignal=Object.assign({},crt,{aiRejected:true,aiReason:'Low confidence: '+aiResult.confidence+'%'});
+      return;
+    }
+    log('TRADE CONFIRMED: conf='+aiResult.confidence+'% TP=$'+aiResult.tp+' SL=$'+aiResult.sl+' | '+aiResult.reason,'profit');
     S.crtStats.confirmed++;
-    S.crtLastSignal=Object.assign({},crt,{aiConfirmed:true,aiConf:aiResult.confidence,
-      aiTp:aiResult.tp,aiSl:aiResult.sl});
-    // Calculate correct lots for target notional
+    S.crtLastSignal=Object.assign({},crt,{aiConfirmed:true,aiConf:aiResult.confidence,aiTp:aiResult.tp,aiSl:aiResult.sl,aiReason:aiResult.reason});
     const targetNotional=(S.futCapital/S.futMaxPos)*S.futLeverage;
     const lots=calcLots(targetNotional,px);
-    const actualNotional=lots*MEXC_LOT_BTC*px;
-    // Loss streak: reduce size
-    const streak=S.futTrades.slice(0,3).filter(t=>t.net<0).length;
+    const streak=S.futTrades.slice(0,3).filter(function(t){return t.net<0;}).length;
     const finalLots=streak>=3?Math.max(1,Math.floor(lots*0.5)):streak>=2?Math.max(1,Math.floor(lots*0.75)):lots;
+    if(streak>=2)log('Recovery mode x'+(streak>=3?'0.5':'0.75')+' size','info');
     if(papOpen<S.futMaxPos)enterFut(px,crt,aiResult,finalLots,true);
     if(S.futMode==='live'&&S.apiKey&&S.apiSecret&&liveOpen<S.futMaxPos){
       S.crtStats.entered++;
