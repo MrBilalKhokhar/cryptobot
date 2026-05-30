@@ -52,12 +52,20 @@ let S = {
   // AI Brain (DeepSeek)
   aiKey:'', aiMinConf:65, aiInterval:20,
   aiDecision:null, aiFutDecision:null,
+  lastSyncResult:null,
   aiLastCall:0, aiFutLastCall:0,
   aiCallCount:0, aiTokensUsed:0, aiCost:0,
 };
 
 // ── PRICE BUFFERS ────────────────────────────────────────────────────────────
 let PX = [], futPX = [], ticks = 0, futTicks = 0;
+
+// ── EXECUTION LOCKS — prevent concurrent tick processing ─────────────────────
+// onFutTick is async (awaits AI for 8-10s). setInterval fires every 1.5s.
+// Without a lock, 5+ ticks run simultaneously → all see liveOpen=0 → ghost trades.
+var futTickBusy = false;   // true while a futures tick is being processed
+var spotTickBusy = false;  // true while a spot tick is being processed
+var futEntering  = false;  // true while a CRT entry is in progress (AI call)
 
 // ── PERSIST ──────────────────────────────────────────────────────────────────
 function save() {
@@ -411,7 +419,10 @@ function closeFutOrder(o,px,why,isPaper){
 
 // ── SPOT TICK ────────────────────────────────────────────────────────────────
 async function onSpotTick(px){
-  S.lastPx=px; PX.push(px); if(PX.length>300)PX.shift(); ticks++;
+  if(spotTickBusy) return;
+  spotTickBusy=true;
+  try{
+    S.lastPx=px; PX.push(px); if(PX.length>300)PX.shift(); ticks++;
   if(!S.botOn)return;
   spotExitCheck(px,true); spotExitCheck(px,false);
   if(ticks<S.warmup)return;
@@ -424,6 +435,7 @@ async function onSpotTick(px){
     if(liveOpen<S.maxPos)enterSpot(px,sig.reason,false);
   }
   S.lastEntry=now;
+  }finally{spotTickBusy=false;}
 }
 function enterSpot(px,reason,isPaper){
   var amt=S.capital/S.maxPos;
@@ -439,6 +451,17 @@ function enterSpot(px,reason,isPaper){
 // Flow: build candle → check exits → detect CRT → AI confirms → enter
 // ══════════════════════════════════════════════════════════════════════════════
 async function onFutTick(px){
+  // LOCK: skip this tick if a previous tick is still processing
+  if(futTickBusy) return;
+  futTickBusy = true;
+  try {
+    await _onFutTick(px);
+  } finally {
+    futTickBusy = false;
+  }
+}
+
+async function _onFutTick(px){
   S.futLastPx=px; futPX.push(px); if(futPX.length>300)futPX.shift(); futTicks++;
   if(!S.futuresOn)return;
   crtUpdateCandle(px);          // build OHLC candle from ticks
@@ -463,6 +486,11 @@ async function onFutTick(px){
 
   log('CRT SETUP: '+crt.type+' sweep='+crt.sweepDepth+'% TP=$'+crt.tp+' SL=$'+crt.sl+' R:R='+crt.rr+'x','buy');
 
+  // BLOCK other ticks immediately — set entry time so cooldown fires
+  S.futLastEntry = now;
+  if(futEntering){ log('CRT skipped — entry already in progress','info'); return; }
+  futEntering = true;
+
   // ── AI CONFIRMATION ───────────────────────────────────────────────────────
   var aiOk={confirmed:true,confidence:70,reason:'no-key'};
   if(S.aiKey){
@@ -470,7 +498,7 @@ async function onFutTick(px){
     if(!aiOk.confirmed||(aiOk.confidence||0)<(S.aiMinConf||65)){
       log('CRT REJECTED by AI (conf='+aiOk.confidence+'%): '+aiOk.reason,'info');
       S.crtLastSignal=Object.assign({},crt,{aiRejected:true,aiReason:aiOk.reason});
-      return;
+      futEntering=false; return;
     }
     log('CRT CONFIRMED by AI conf='+aiOk.confidence+'% | '+aiOk.reason,'profit');
   }
@@ -483,8 +511,10 @@ async function onFutTick(px){
     S.crtStats.entered++;
     enterCRT(px,crt,false);
   }
+  futEntering=false;
   S.futLastEntry=now;
 }
+// end _onFutTick
 
 function enterCRT(px,crt,isPaper){
   // Recovery: reduce size after losses
@@ -702,6 +732,7 @@ const server=http.createServer(function(req,res){
       futTicks,
       // AI
       aiEnabled:!!(S.aiKey),aiMinConf:S.aiMinConf,aiInterval:S.aiInterval,
+      autoSync:S_autoSync,lastSyncResult:S.lastSyncResult,
       aiFutDecision:S.aiFutDecision,aiCallCount:S.aiCallCount,aiTokensUsed:S.aiTokensUsed,aiCost:S.aiCost,
       // Meta
       hasApiKeys:!!(S.apiKey&&S.apiSecret),startedAt:S.startedAt,savedAt:S.savedAt,
@@ -746,8 +777,8 @@ const server=http.createServer(function(req,res){
         save();send(res,200,{ok:true,candleSize:S.crtCandleSize,estWarmup:(S.crtCandleSize*2*1.5/60).toFixed(1)+'min'});return;
       }
       if(url==='/stopfutures'){
-        S.futuresOn=false;S.futOrders=[];S.futPapOrders=[];stopFutFeed();
-        log('Futures bot stopped.','info');save();send(res,200,{ok:true});return;
+        S.futuresOn=false;S.futOrders=[];S.futPapOrders=[];stopFutFeed();stopAutoSync();
+        log('Futures bot stopped. Auto-sync paused.','info');save();send(res,200,{ok:true});return;
       }
       if(url==='/config'){
         if(d.pair)S.pair=d.pair.replace('/','');
@@ -995,6 +1026,12 @@ const server=http.createServer(function(req,res){
       }
       // ── RESET PAPER ────────────────────────────────────────────────────────
       if(url==='/resetpaper'){S.papProfit=0;S.papT=0;S.papW=0;S.papL=0;S.papBest=0;S.papFees=0;S.papTrades=[];S.papOrders=[];save();send(res,200,{ok:true});return;}
+      if(url==='/toggleautosync'){
+        S_autoSync=!!d.enabled;
+        if(S_autoSync&&S.futuresOn){startAutoSync();log('Auto-sync ON: checking MEXC every 30s','profit');}
+        else{stopAutoSync();log('Auto-sync OFF','info');}
+        send(res,200,{ok:true,autoSync:S_autoSync}); return;
+      }
       if(url==='/syncpositions'){
         log('Manual position sync requested...','info');
         syncMexcPositions(function(n){
@@ -1021,11 +1058,69 @@ const server=http.createServer(function(req,res){
   send(res,404,{error:'Not found'});
 });
 
-// ── SYNC MEXC POSITIONS ──────────────────────────────────────────────────────
-// On startup: fetch real open positions from MEXC and add them to state.
-// This prevents "ghost positions" — MEXC has open trades but bot doesn't know.
-function syncMexcPositions(cb){
+// ── AUTO-SYNC ENGINE ─────────────────────────────────────────────────────────
+// Every 30s: fetch MEXC open positions, sync any unknowns, ask AI for TP/SL
+var autoSyncTimer = null;
+var lastAutoSync  = 0;
+var S_autoSync    = true;   // enabled by default
+
+function startAutoSync(){
+  if(autoSyncTimer) clearInterval(autoSyncTimer);
+  autoSyncTimer = setInterval(function(){ syncMexcPositions(null, true); }, 30000);
+  log('Auto-sync started: checking MEXC positions every 30s','info');
+}
+function stopAutoSync(){
+  if(autoSyncTimer){ clearInterval(autoSyncTimer); autoSyncTimer=null; }
+}
+
+// Ask AI to set proper TP/SL for a synced position
+async function aiSetTpSl(o){
+  if(!S.aiKey) return;
+  var px=S.futLastPx||S.lastPx;
+  if(!px) return;
+  var isLng=o.direction!=='SHORT';
+  var curNet=futFee(o.entryPx,px,o.margin,o.leverage,isLng).net;
+  var pctMove=((px-o.entryPx)/o.entryPx*100).toFixed(3);
+  var inProfit=curNet>0;
+  var p='You are a futures position manager on MEXC. Set TP and SL for this open trade.\n\n';
+  p+='POSITION: '+o.direction+' entry=$'+o.entryPx.toFixed(2)+' current=$'+px.toFixed(2)+'\n';
+  p+='Move: '+pctMove+'% | P&L: '+(curNet>=0?'+':'')+'$'+curNet.toFixed(4)+'\n';
+  p+='Leverage: '+o.leverage+'x | Notional: $'+o.notional.toFixed(2)+' | Fee: 0.04% RT\n\n';
+  p+='RULES:\n';
+  p+='- TP must be at least 0.05% from entry (cover fees + profit)\n';
+  p+='- If in profit: set SL above entry to lock gains\n';
+  p+='- If at loss: set SL to limit loss (max 0.3% from entry)\n';
+  p+='- TP should be realistic resistance/support level\n\n';
+  p+='Reply ONLY JSON: {"tp":103250.50,"sl":102800.00,"reason":"brief reason","confidence":78}';
+  return new Promise(function(resolve){
+    var body=JSON.stringify({model:'deepseek-chat',messages:[{role:'system',content:'Futures position manager. JSON only. No text outside JSON.'},{role:'user',content:p}],max_tokens:100,temperature:0.1,stream:false});
+    var ts2=Date.now().toString();
+    var req2=https.request({hostname:'api.deepseek.com',path:'/v1/chat/completions',method:'POST',
+      headers:{'Authorization':'Bearer '+S.aiKey,'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)},timeout:10000},function(r2){
+      var d2='';r2.on('data',function(c){d2+=c;});
+      r2.on('end',function(){
+        try{
+          var resp=JSON.parse(d2);
+          S.aiTokensUsed+=(resp.usage&&resp.usage.total_tokens||0);
+          var raw2=(resp.choices&&resp.choices[0]&&resp.choices[0].message&&resp.choices[0].message.content)||'{}';
+          var m=raw2.match(/\{[\s\S]*\}/);
+          if(m){
+            var dec=JSON.parse(m[0]);
+            if(dec.tp&&dec.tp>0){o.tp=parseFloat(dec.tp.toFixed(4));}
+            if(dec.sl&&dec.sl>0){o.sl=parseFloat(dec.sl.toFixed(4));}
+            log('AI TP/SL set: '+o.direction+' TP=$'+o.tp.toFixed(2)+' SL=$'+o.sl.toFixed(2)+' | '+dec.reason,'profit');
+          }
+          resolve();
+        }catch(e){resolve();}
+      });
+    });
+    req2.on('error',function(){resolve();}); req2.on('timeout',function(){req2.destroy();resolve();});
+    req2.write(body); req2.end();
+  });
+}
+function syncMexcPositions(cb, silent){
   if(!S.apiKey||!S.apiSecret){if(cb)cb(0);return;}
+  lastAutoSync=Date.now();
   var ts=Date.now().toString();
   var sig=crypto.createHmac('sha256',S.apiSecret).update(S.apiKey+ts+'').digest('hex');
   var req=https.request({
@@ -1037,22 +1132,45 @@ function syncMexcPositions(cb){
     res.on('end',function(){
       try{
         var r=JSON.parse(d);
-        if(!r.success||!r.data||!r.data.length){if(cb)cb(0);return;}
+
+        // ── Check for closed positions (MEXC has no position, bot still tracks) ──
+        var liveOpen=S.futOrders.filter(function(o){return o.status==='open';});
+        if(r.success&&liveOpen.length>0){
+          var mexcIds=(r.data||[]).map(function(p){return p.positionId;});
+          liveOpen.forEach(function(o){
+            if(o.mexcId&&mexcIds.indexOf(o.mexcId)<0){
+              // Position was open in bot but MEXC closed it (TP/SL hit on MEXC side)
+              var px=S.futLastPx||S.lastPx;
+              log('MEXC CLOSED detected: '+o.direction+' entry=$'+o.entryPx.toFixed(2)+' — syncing close','err');
+              closeFutOrder(o,px,'MEXC-CLOSE',false);
+              S.futOrders=S.futOrders.filter(function(x){return x.status==='open';});
+              save();
+            }
+          });
+        }
+
+        if(!r.success||!r.data||!r.data.length){S.lastSyncResult={time:new Date().toISOString().slice(11,19),found:0,synced:0};if(cb)cb(0);return;}
         var synced=0;
+        var newPositions=[];
         r.data.forEach(function(pos){
           if(pos.symbol!==S.futPair)return;
-          // Check if we already track this position
-          var exists=S.futOrders.some(function(o){return o.mexcId===pos.positionId||o.status==='open';});
+          // Precise match: same mexcId OR same direction+similar entry price (within 0.1%)
+          var exists=S.futOrders.some(function(o){
+            if(o.status!=='open')return false;
+            if(o.mexcId&&o.mexcId===pos.positionId)return true;
+            var entPx=parseFloat(pos.openAvgPrice||0);
+            var sameDir=(pos.positionType===1)===(o.direction==='LONG');
+            var samePx=entPx>0&&Math.abs(o.entryPx-entPx)/entPx<0.001;
+            return sameDir&&samePx;
+          });
           if(exists)return;
           var isLong=pos.positionType===1;
           var entryPx=parseFloat(pos.openAvgPrice||0);
           var margin=parseFloat(pos.margin||S.futCapital/S.futMaxPos);
           var lev=parseInt(pos.leverage||S.futLeverage);
           var notional=margin*lev;
-          // Estimate TP/SL from current price
-          var curPx=S.futLastPx||entryPx;
-          var tp=isLong ? entryPx*(1+S.futTpPct/100) : entryPx*(1-S.futTpPct/100);
-          var sl=isLong ? entryPx*(1-S.futSlPct/100) : entryPx*(1+S.futSlPct/100);
+          var tp=isLong?entryPx*(1+S.futTpPct/100):entryPx*(1-S.futTpPct/100);
+          var sl=isLong?entryPx*(1-S.futSlPct/100):entryPx*(1+S.futSlPct/100);
           var o={
             id:Date.now()+synced, status:'open', isPaper:false, isFutures:true,
             direction:isLong?'LONG':'SHORT',
@@ -1061,20 +1179,27 @@ function syncMexcPositions(cb){
             tp:parseFloat(tp.toFixed(4)), sl:parseFloat(sl.toFixed(4)),
             bePx:parseFloat(futBE(entryPx,margin,lev,isLong).toFixed(4)),
             beStopMoved:false, peakPx:entryPx, peakNet:0,
-            crtType:'SYNCED', crtRR:0,
+            crtType:'SYNCED', crtRR:0, openedAt:Date.now(),
             openAt:new Date().toISOString().slice(11,19),
             mexcId:pos.positionId,
-            reason:'SYNCED from MEXC on startup'
+            reason:'SYNCED from MEXC'
           };
-          S.futOrders.push(o); synced++;
-          log('SYNCED ghost position: '+o.direction+' entry=$'+entryPx.toFixed(2)+' margin=$'+margin.toFixed(2)+' contracts='+o.contracts,'err');
+          S.futOrders.push(o); newPositions.push(o); synced++;
+          if(!silent) log('SYNCED: '+o.direction+' entry=$'+entryPx.toFixed(2)+' contracts='+o.contracts+' margin=$'+margin.toFixed(2),'err');
         });
+        S.lastSyncResult={time:new Date().toISOString().slice(11,19),found:r.data.length,synced:synced};
         if(synced>0){
-          log('SYNCED '+synced+' MEXC position(s) that bot did not know about!','err');
-          log('These positions now have estimated TP/SL. Check MEXC app and close manually if needed.','info');
+          log('SYNCED '+synced+' MEXC position(s) bot did not track!','err');
           save();
-        } else {
-          log('MEXC position check: no ghost positions found.','info');
+          // Ask AI to set proper TP/SL for each synced position
+          if(S.aiKey){
+            Promise.all(newPositions.map(aiSetTpSl)).then(function(){
+              save();
+              log('AI has set TP/SL for all synced positions','profit');
+            });
+          }
+        } else if(!silent){
+          log('MEXC sync: all '+r.data.length+' position(s) already tracked','info');
         }
         if(cb)cb(synced);
       }catch(e){log('Position sync error: '+e.message,'err');if(cb)cb(0);}
@@ -1100,6 +1225,7 @@ server.listen(PORT,'0.0.0.0',function(){
     S.crtCandles=[]; S.crtCurrentCandle=null;
     log('Auto-resuming futures CRT bot...','info');
     startFutFeed();
+    if(S_autoSync) startAutoSync();
     // After 3s (price feed has started), sync MEXC positions
     setTimeout(function(){
       log('Checking MEXC for open positions not tracked by bot...','info');
