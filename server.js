@@ -539,17 +539,39 @@ async function _processFutTick(px){
     log('TRADE CONFIRMED: conf='+aiResult.confidence+'% TP=$'+aiResult.tp+' SL=$'+aiResult.sl+' | '+aiResult.reason,'profit');
     S.crtStats.confirmed++;
     S.crtLastSignal=Object.assign({},crt,{aiConfirmed:true,aiConf:aiResult.confidence,aiTp:aiResult.tp,aiSl:aiResult.sl,aiReason:aiResult.reason});
-    // Record signature IMMEDIATELY so any concurrent ticks are blocked for this candle
-    S.lastCrtSig=crtSig; S.lastCrtSigTime=now; S.lastCrtCandle=prevC;
-    const targetNotional=(S.futCapital/S.futMaxPos)*S.futLeverage;
-    const lots=calcLots(targetNotional,px);
-    const streak=S.futTrades.slice(0,3).filter(function(t){return t.net<0;}).length;
-    const finalLots=streak>=3?Math.max(1,Math.floor(lots*0.5)):streak>=2?Math.max(1,Math.floor(lots*0.75)):lots;
-    if(streak>=2)log('Recovery mode x'+(streak>=3?'0.5':'0.75')+' size','info');
-    if(papOpen<S.futMaxPos)enterFut(px,crt,aiResult,finalLots,true);
-    if(S.futMode==='live'&&S.apiKey&&S.apiSecret&&liveOpen<S.futMaxPos){
-      S.crtStats.entered++;
-      enterFut(px,crt,aiResult,finalLots,false);
+
+    // RE-READ positions NOW — AI took 8-10s, stale papOpen/liveOpen would block entry
+    var papOpenNow  = S.futPapOrders.filter(function(o){return o.status==='open';}).length;
+    var liveOpenNow = S.futOrders.filter(function(o){return o.status==='open';}).length;
+
+    var targetNotional=(S.futCapital/S.futMaxPos)*S.futLeverage;
+    var lots=calcLots(targetNotional,px);
+    var streak=S.futTrades.slice(0,3).filter(function(t){return t.net<0;}).length;
+    var finalLots=streak>=3?Math.max(1,Math.floor(lots*0.5)):streak>=2?Math.max(1,Math.floor(lots*0.75)):lots;
+    if(streak>=2)log('Recovery x'+(streak>=3?'0.5':'0.75')+' size ('+streak+' losses)','info');
+
+    log('ENTRY CHECK: mode='+S.futMode+' paper='+papOpenNow+'/'+S.futMaxPos+' live='+liveOpenNow+'/'+S.futMaxPos+' lots='+finalLots+'','info');
+
+    // Paper entry — always runs
+    if(papOpenNow<S.futMaxPos){
+      enterFut(px,crt,aiResult,finalLots,true);
+    } else {
+      log('Paper SKIPPED: already '+papOpenNow+'/'+S.futMaxPos+' open','info');
+    }
+
+    // Live entry
+    if(S.futMode==='live'){
+      if(!S.apiKey||!S.apiSecret){
+        log('Live SKIPPED: no API keys — save them in Config tab','err');
+      } else if(liveOpenNow>=S.futMaxPos){
+        log('Live SKIPPED: '+liveOpenNow+'/'+S.futMaxPos+' positions already open','info');
+      } else {
+        S.crtStats.entered++;
+        enterFut(px,crt,aiResult,finalLots,false);
+        log('LIVE ORDER sent to MEXC','profit');
+      }
+    } else {
+      log('Live SKIPPED: mode='+S.futMode+' (click Futures Live Mode to trade real money)','info');
     }
   }finally{futEntering=false;}
 }
