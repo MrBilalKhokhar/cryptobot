@@ -2,8 +2,8 @@
   "name": "cryptobot-pro",
   "version": "10.0.0",
   "description": "CryptoBot Pro v10 — CRT + DeepSeek AI",
-  "main": "server_v10.js",
-  "scripts": { "start": "node server_v10.js" },
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
   "dependencies": {},
   "engines": { "node": ">=18.0.0" },
   "license": "MIT"
