@@ -1,9 +1,9 @@
 {
   "name": "cryptobot-pro",
-  "version": "4.0.0",
-  "description": "CryptoBot Pro — Fast Scalp Engine for MEXC",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "version": "10.0.0",
+  "description": "CryptoBot Pro v10 — CRT + DeepSeek AI strict mode",
+  "main": "server_v10.js",
+  "scripts": { "start": "node server_v10.js" },
   "dependencies": { "ws": "^8.16.0" },
   "engines": { "node": ">=18.0.0" },
   "license": "MIT"

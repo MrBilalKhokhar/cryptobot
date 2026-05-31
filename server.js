@@ -10,7 +10,7 @@ const BOT_PIN    = process.env.BOT_PIN||'123456';
 const ENV_KEY    = (process.env.MEXC_KEY   ||'').trim();
 const ENV_SECRET = (process.env.MEXC_SECRET||'').trim();
 
-console.log('=== CryptoBot Pro v9 ===');
+console.log('=== CryptoBot Pro v10 ===');
 console.log('Port:',PORT);
 
 // ── CONSTANTS ────────────────────────────────────────────────────────────────
@@ -182,49 +182,66 @@ function crtUpdateCandle(px){
     S.crtCandles.unshift(Object.assign({},c));
     if(S.crtCandles.length>50)S.crtCandles.length=50;
     S.crtCurrentCandle={o:px,h:px,l:px,c:px,ticks:1};
-    // New candle formed — reset signal signature so fresh sweeps can be detected
-    S.lastCrtSig=''; S.lastCrtCandle=null;
+    // Reset signature — allow fresh entries on next candle
+    S.lastCrtSig=''; S.lastCrtSigTime=0;
+    const prev=S.crtCandles[0];
+    if(prev)log('[CRT] Candle #'+S.crtCandles.length+' H=$'+prev.h.toFixed(2)+' L=$'+prev.l.toFixed(2)+' range='+(((prev.h-prev.l)/prev.l)*100).toFixed(3)+'%','info');
   }
 }
+
 function crtDetect(px){
   if(S.crtCandles.length<2)return null;
-  const prev=S.crtCandles[0],curr=S.crtCurrentCandle;
+  const prev=S.crtCandles[0], curr=S.crtCurrentCandle;
   if(!prev||!curr)return null;
-  const prevRange=prev.h-prev.l, prevRangePct=prevRange/prev.l*100;
-  if(prevRangePct<0.015)return null;           // candle too small
-  const sweepBuf=Math.max(prevRange*0.10, prev.l*0.00008);
-  const minTP=FUT_TAKER*100*2;                 // just cover fees × 2
-  const minRR=0.8;
 
-  // BULLISH CRT
-  if(curr.l<prev.l-sweepBuf && px>prev.l){
-    const sweepD=(prev.l-curr.l)/prev.l*100;
-    if(sweepD<0.002)return null;
-    const tp=parseFloat(prev.h.toFixed(4));
-    const sl=parseFloat((curr.l-sweepBuf*0.3).toFixed(4));
-    const tpD=(tp-px)/px*100, slD=(px-sl)/px*100;
-    const rr=slD>0?tpD/slD:0;
-    if(tpD<minTP||rr<minRR)return null;
+  const prevRange    = prev.h - prev.l;
+  const prevRangePct = prevRange / prev.l * 100;
+
+  // Very loose range filter — don't reject small candles
+  if(prevRangePct < 0.012) return null;
+
+  // Adaptive sweep buffer: 8% of range OR 0.005% of price
+  const sweepBuf = Math.max(prevRange * 0.08, prev.l * 0.00005);
+
+  // Only R:R filter — removed minTP (was blocking 75%+ of valid setups!)
+  const minRR = 0.75;
+
+  // ── BULLISH CRT ──────────────────────────────────────────────────────────
+  if(curr.l < prev.l - sweepBuf && px > prev.l){
+    const sweepD = (prev.l - curr.l) / prev.l * 100;
+    if(sweepD < 0.001) return null;
+    const tp  = parseFloat(prev.h.toFixed(2));
+    const sl  = parseFloat((curr.l - sweepBuf * 0.2).toFixed(2));
+    const tpD = (tp - px) / px * 100;
+    const slD = (px - sl) / px * 100;
+    const rr  = slD > 0 ? tpD / slD : 0;
+    if(rr < minRR || tp <= px) return null;
     S.crtStats.setups++;
-    return {direction:'BUY',type:'BULLISH_CRT',sweepDepth:sweepD.toFixed(4),
-      entry:px,tp,sl,tpPct:parseFloat(tpD.toFixed(4)),slPct:parseFloat(slD.toFixed(4)),
+    return {direction:'BUY',type:'BULLISH_CRT',
+      sweepDepth:sweepD.toFixed(4),sweepLow:curr.l,sweepHigh:null,
+      entry:px,tp:tp,sl:sl,
+      tpPct:parseFloat(tpD.toFixed(4)),slPct:parseFloat(slD.toFixed(4)),
       rr:parseFloat(rr.toFixed(2)),prevRange:prevRangePct.toFixed(4),
-      reason:'Bullish CRT swept $'+curr.l.toFixed(2)+' below $'+prev.l.toFixed(2)+' R:R='+rr.toFixed(2)+'x'};
+      reason:'Bullish CRT: swept $'+curr.l.toFixed(2)+' below $'+prev.l.toFixed(2)+' R:R='+rr.toFixed(2)+'x range='+prevRangePct.toFixed(3)+'%'};
   }
-  // BEARISH CRT
-  if(curr.h>prev.h+sweepBuf && px<prev.h){
-    const sweepDB=(curr.h-prev.h)/prev.h*100;
-    if(sweepDB<0.002)return null;
-    const tpB=parseFloat(prev.l.toFixed(4));
-    const slB=parseFloat((curr.h+sweepBuf*0.3).toFixed(4));
-    const tpDB=(px-tpB)/px*100, slDB=(slB-px)/px*100;
-    const rrB=slDB>0?tpDB/slDB:0;
-    if(tpDB<minTP||rrB<minRR)return null;
+
+  // ── BEARISH CRT ──────────────────────────────────────────────────────────
+  if(curr.h > prev.h + sweepBuf && px < prev.h){
+    const sweepDB = (curr.h - prev.h) / prev.h * 100;
+    if(sweepDB < 0.001) return null;
+    const tpB  = parseFloat(prev.l.toFixed(2));
+    const slB  = parseFloat((curr.h + sweepBuf * 0.2).toFixed(2));
+    const tpDB = (px - tpB) / px * 100;
+    const slDB = (slB - px) / px * 100;
+    const rrB  = slDB > 0 ? tpDB / slDB : 0;
+    if(rrB < minRR || tpB >= px) return null;
     S.crtStats.setups++;
-    return {direction:'SHORT',type:'BEARISH_CRT',sweepDepth:sweepDB.toFixed(4),
-      entry:px,tp:tpB,sl:slB,tpPct:parseFloat(tpDB.toFixed(4)),slPct:parseFloat(slDB.toFixed(4)),
+    return {direction:'SHORT',type:'BEARISH_CRT',
+      sweepDepth:sweepDB.toFixed(4),sweepLow:null,sweepHigh:curr.h,
+      entry:px,tp:tpB,sl:slB,
+      tpPct:parseFloat(tpDB.toFixed(4)),slPct:parseFloat(slDB.toFixed(4)),
       rr:parseFloat(rrB.toFixed(2)),prevRange:prevRangePct.toFixed(4),
-      reason:'Bearish CRT swept $'+curr.h.toFixed(2)+' above $'+prev.h.toFixed(2)+' R:R='+rrB.toFixed(2)+'x'};
+      reason:'Bearish CRT: swept $'+curr.h.toFixed(2)+' above $'+prev.h.toFixed(2)+' R:R='+rrB.toFixed(2)+'x range='+prevRangePct.toFixed(3)+'%'};
   }
   return null;
 }
@@ -466,38 +483,23 @@ async function _processFutTick(px){
   if(papOpen>=S.futMaxPos&&liveOpen>=S.futMaxPos)return;
   const crt=crtDetect(px);
   if(!crt){
+    // Periodic log so user can see CRT engine is scanning
     if(futTicks%40===0){
       const p=S.crtCandles[0],c=S.crtCurrentCandle;
-      if(p&&c)log('[CRT T'+futTicks+'] $'+px.toFixed(2)+' prevH=$'+p.h.toFixed(2)+' prevL=$'+p.l.toFixed(2)+' tick='+c.ticks+'/'+S.crtCandleSize,'info');
+      if(p&&c)log('[CRT T'+futTicks+'] $'+px.toFixed(2)+' prevH=$'+p.h.toFixed(2)+' prevL=$'+p.l.toFixed(2)+' currH=$'+c.h.toFixed(2)+' currL=$'+c.l.toFixed(2)+' tick='+c.ticks+'/'+S.crtCandleSize+' setups='+S.crtStats.setups,'info');
+      else log('[CRT T'+futTicks+'] $'+px.toFixed(2)+' candles='+S.crtCandles.length+'/2 needed','info');
     }
     return;
   }
 
-  // ── GHOST TRADE PREVENTION ──────────────────────────────────────────────────
-  // Same sweep level stays valid for the ENTIRE candle (40 ticks = 60s).
-  // Without this check, the bot re-enters the SAME trade every 6s (cooldown),
-  // causing 5-8 ghost trades per CRT signal.
-  // Signature = direction + sweep level + prev candle H/L (unique per candle)
-  const prevC = S.crtCandles[0];
-  const crtSig = crt.direction + '_' +
-    (prevC ? prevC.h.toFixed(2)+'_'+prevC.l.toFixed(2) : 'none') + '_' +
-    (crt.direction==='BUY' ? crt.sweepLow : crt.sweepHigh||'?');
-  const sigAge = now - S.lastCrtSigTime;
-  const cancleDuration = S.crtCandleSize * 1500; // ms for one full candle
+  // GHOST TRADE PREVENTION: mark this sweep seen BEFORE async AI call
+  // Same sweep fires every 1.5s for 60s — without dedup = 40 duplicate trades
+  const crtSig=crt.direction+'_'+(S.crtCandles[0]?S.crtCandles[0].h.toFixed(2)+'_'+S.crtCandles[0].l.toFixed(2):'x')+'_'+(crt.direction==='BUY'?crt.sweepLow:crt.sweepHigh||'x');
+  if(S.lastCrtSig===crtSig)return; // already handling this sweep
+  S.lastCrtSig=crtSig; S.lastCrtSigTime=now;
 
-  if(S.lastCrtSig === crtSig && sigAge < cancleDuration) {
-    // Already entered this exact sweep — wait for new candle before re-entering
-    if(futTicks % 20 === 0) log('CRT: same sweep already traded '+Math.round(sigAge/1000)+'s ago — waiting for new candle','info');
-    return;
-  }
-
-  // Check if position limit already reached (hard guard before any locking)
-  const papOpenCheck = S.futPapOrders.filter(function(o){return o.status==='open';}).length;
-  const liveOpenCheck = S.futOrders.filter(function(o){return o.status==='open';}).length;
-  if(liveOpenCheck >= S.futMaxPos) {
-    // Already at max live positions — do not enter
-    return;
-  }
+  // Hard position cap
+  if(S.futOrders.filter(function(o){return o.status==='open';}).length>=S.futMaxPos)return;
 
   // LOCK — block all other ticks while DeepSeek is being consulted
   futEntering=true;
