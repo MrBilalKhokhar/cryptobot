@@ -51,6 +51,7 @@ let S = {
   futLastPx:0, futLastEntry:0, futRealBalance:0,
   // CRT engine
   crtCandleSize:40, crtCandles:[], crtCurrentCandle:null,
+  crtCandleCounter:0,  // monotonic counter (never resets, never capped — for 1-trade-per-candle lock)
   crtLastSignal:null, crtStats:{setups:0,confirmed:0,entered:0},
   // AI
   aiKey:'', aiMinConf:65, aiInterval:20,
@@ -72,7 +73,8 @@ let S = {
 // ── LOCKS — prevent concurrent ghost trades ───────────────────────────────────
 let futTickBusy = false;
 let futEntering = false;
-let liveOrderPending = false;   // true while a live MEXC order is being sent
+let liveOrderPending = false;
+let _liveOrderPendingSince = 0;   // true while a live MEXC order is being sent
 let lastEntryCandleCount = -1;  // which candle index we last entered on (1 trade/candle)
 
 // ── PRICE BUFFERS ────────────────────────────────────────────────────────────
@@ -192,6 +194,7 @@ function crtUpdateCandle(px){
     S.crtCandles.unshift(Object.assign({},c));
     if(S.crtCandles.length>50)S.crtCandles.length=50;
     S.crtCurrentCandle={o:px,h:px,l:px,c:px,ticks:1};
+    S.crtCandleCounter=(S.crtCandleCounter||0)+1;  // unique ID for each candle
     // Reset signature — allow fresh entries on next candle
     S.lastCrtSig=''; S.lastCrtSigTime=0;
     const prev=S.crtCandles[0];
@@ -517,6 +520,11 @@ function closeFut(o,px,why,isPaper){
 // Entry detection runs only when AI is NOT busy (futEntering=false).
 async function onFutTick(px){
   try{
+    // ── STEP 0: Safety — auto-clear stuck liveOrderPending if older than 30s ─
+    if(liveOrderPending && _liveOrderPendingSince && (Date.now()-_liveOrderPendingSince>30000)){
+      log('liveOrderPending was stuck — auto-clearing','info');
+      liveOrderPending=false; _liveOrderPendingSince=0;
+    }
     // ── STEP 1: ALWAYS update price buffer, candle, check exits ─────────────
     S.futLastPx=px;
     futPX.push(px); if(futPX.length>300)futPX.shift();
@@ -556,9 +564,9 @@ async function onFutTick(px){
     // Use FIXED prev.h/prev.l as signature (stable — don't use curr.l/curr.h
     // which change every tick and would re-fire the same setup 40 times)
     // ── STEP 4: GHOST TRADE PREVENTION (4 hard locks) ───────────────────────
-    // Lock A: one trade per candle. Once we enter on a candle, no more entries
-    //         until a NEW candle forms — kills re-entry after AI-call candle flip.
-    if(lastEntryCandleCount === S.crtCandles.length){
+    // Lock A: one trade per candle. Uses MONOTONIC counter (not array length
+    //         which caps at 50, causing permanent lockout — that was the bug).
+    if(lastEntryCandleCount === S.crtCandleCounter){
       return; // already traded on this candle
     }
     // Lock B: signature dedup — same sweep (fixed prev H/L) can't fire twice
@@ -639,18 +647,20 @@ async function onFutTick(px){
         log('Live SKIPPED: an order is already being placed','info');
       }else{
         // Lock D: block any other live order until this one is sent + cooldown
-        liveOrderPending=true;
+        liveOrderPending=true; _liveOrderPendingSince=Date.now();
         S.crtStats.entered++;
         enterFut(px,crt,aiResult,finalLots,false);
         log('LIVE ORDER placed on MEXC','profit');
         // Release after 8s (enough for MEXC to register the position)
-        setTimeout(function(){ liveOrderPending=false; }, 8000);
+        setTimeout(function(){ liveOrderPending=false; _liveOrderPendingSince=0; }, 8000);
       }
     }else{
       log('Live SKIPPED: mode='+S.futMode+' — click Futures Live Mode to trade real money','info');
     }
-    // Record candle count so no second trade fires on this same candle
-    lastEntryCandleCount = S.crtCandles.length;
+    // Record candle counter so no second trade fires on this same candle
+    // Only set if we actually placed a trade (paper or live entered)
+    var didEnter = (papNow<S.futMaxPos) || (S.futMode==='live' && S.apiKey && S.apiSecret && liveNow<S.futMaxPos && !liveOrderPending);
+    if(didEnter) lastEntryCandleCount = S.crtCandleCounter;
   }catch(e){
     console.error('[onFutTick error]',e.message);
   }finally{
@@ -997,7 +1007,7 @@ const server=http.createServer((req,res)=>{
         S.futuresOn=true;S.futOrders=[];S.futPapOrders=[];S.futLastEntry=0;
         S.crtCandles=[];S.crtCurrentCandle=null;S.crtLastSignal=null;
         S.crtStats={setups:0,confirmed:0,entered:0};futPX=[];futTicks=0;
-        futTickBusy=false;futEntering=false;liveOrderPending=false;lastEntryCandleCount=-1;
+        futTickBusy=false;futEntering=false;liveOrderPending=false;lastEntryCandleCount=-1;S.crtCandleCounter=0;
         if(d.mode)S.futMode=d.mode;if(d.pair)S.futPair=d.pair;
         if(d.capital)S.futCapital=parseFloat(d.capital)||20;
         if(d.leverage)S.futLeverage=parseInt(d.leverage)||3;
