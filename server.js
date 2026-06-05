@@ -172,6 +172,22 @@ function saveKeys() {
 }
 
 function loadKeys() {
+  // 1) First check environment variables (set on Railway → Variables tab)
+  //    These survive every redeploy automatically and are the recommended way.
+  let envMexcKey    = process.env.MEXC_API_KEY    || '';
+  let envMexcSecret = process.env.MEXC_API_SECRET || '';
+  let envAiKey      = process.env.DEEPSEEK_API_KEY || '';
+
+  if (envMexcKey || envMexcSecret || envAiKey) {
+    if (envMexcKey)    runtime.mexcKeys.apiKey    = envMexcKey.trim().replace(/[\r\n\t]/g, '');
+    if (envMexcSecret) runtime.mexcKeys.apiSecret = envMexcSecret.trim().replace(/[\r\n\t]/g, '');
+    if (envAiKey)      runtime.aiKey              = envAiKey.trim().replace(/[\r\n\t]/g, '');
+    state.ai.hasKey = !!runtime.aiKey;
+    log('INFO', `Keys loaded from ENV vars — MEXC: ${runtime.mexcKeys.apiKey ? '✓' : '✗'} | AI: ${runtime.aiKey ? '✓' : '✗'}`);
+    return;
+  }
+
+  // 2) Fall back to the encrypted file on disk
   try {
     if (fs.existsSync(KEYS_FILE)) {
       const dec = decrypt(fs.readFileSync(KEYS_FILE, 'utf8'));
@@ -181,12 +197,12 @@ function loadKeys() {
         runtime.mexcKeys.apiSecret = k.apiSecret || '';
         runtime.aiKey              = k.aiKey   || '';
         state.ai.hasKey            = !!runtime.aiKey;
-        log('INFO', `Keys loaded — MEXC: ${runtime.mexcKeys.apiKey ? '✓' : '✗'} | AI: ${runtime.aiKey ? '✓' : '✗'}`);
+        log('INFO', `Keys loaded from disk — MEXC: ${runtime.mexcKeys.apiKey ? '✓' : '✗'} | AI: ${runtime.aiKey ? '✓' : '✗'}`);
       } else {
         log('WARN', 'Could not decrypt keys file — wrong ENC_PASSPHRASE?');
       }
     } else {
-      log('INFO', 'No saved keys file yet (first run)');
+      log('INFO', 'No saved keys file yet — set MEXC_API_KEY, MEXC_API_SECRET, DEEPSEEK_API_KEY env vars OR save via dashboard');
     }
   } catch (e) {
     log('ERR', 'loadKeys: ' + e.message);
